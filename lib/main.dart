@@ -76,19 +76,9 @@ class _HomeShellState extends State<HomeShell> {
           return Scaffold(
             appBar: AppBar(
               title: Text(titles[_currentIndex]),
-              actions: [
-                IconButton(
-                  onPressed: _reload,
-                  icon: const Icon(Icons.refresh),
-                ),
-              ],
+              actions: [IconButton(onPressed: _reload, icon: const Icon(Icons.refresh))],
             ),
-            body: Stack(
-              children: [
-                gradientBackground,
-                const Center(child: CircularProgressIndicator()),
-              ],
-            ),
+            body: Stack(children: [gradientBackground, const Center(child: CircularProgressIndicator())]),
           );
         }
 
@@ -96,12 +86,7 @@ class _HomeShellState extends State<HomeShell> {
           return Scaffold(
             appBar: AppBar(
               title: Text(titles[_currentIndex]),
-              actions: [
-                IconButton(
-                  onPressed: _reload,
-                  icon: const Icon(Icons.refresh),
-                ),
-              ],
+              actions: [IconButton(onPressed: _reload, icon: const Icon(Icons.refresh))],
             ),
             body: Stack(
               children: [
@@ -114,10 +99,7 @@ class _HomeShellState extends State<HomeShell> {
                       const SizedBox(height: 12),
                       const Text('数据加载失败，请稍后再试'),
                       const SizedBox(height: 12),
-                      ElevatedButton(
-                        onPressed: _reload,
-                        child: const Text('重新获取'),
-                      ),
+                      ElevatedButton(onPressed: _reload, child: const Text('重新获取')),
                     ],
                   ),
                 ),
@@ -128,7 +110,7 @@ class _HomeShellState extends State<HomeShell> {
 
         final overview = snapshot.data!;
         final pages = [
-          TimetableTab(weeklyLessons: overview.weeklyLessons),
+          TimetableTab(weekDays: overview.weekDays),
           AgendaTab(items: overview.scheduleItems),
           const UserTab(),
         ];
@@ -138,21 +120,14 @@ class _HomeShellState extends State<HomeShell> {
             title: Text(titles[_currentIndex]),
             actions: [
               if (_currentIndex != 2)
-                IconButton(
-                  onPressed: _reload,
-                  icon: const Icon(Icons.refresh),
-                  tooltip: '刷新数据',
-                ),
+                IconButton(onPressed: _reload, icon: const Icon(Icons.refresh), tooltip: '刷新数据'),
             ],
           ),
           body: Stack(
             children: [
               gradientBackground,
               SafeArea(
-                child: IndexedStack(
-                  index: _currentIndex,
-                  children: pages,
-                ),
+                child: IndexedStack(index: _currentIndex, children: pages),
               ),
             ],
           ),
@@ -172,49 +147,160 @@ class _HomeShellState extends State<HomeShell> {
 }
 
 class TimetableTab extends StatelessWidget {
-  const TimetableTab({super.key, required this.weeklyLessons});
+  const TimetableTab({super.key, required this.weekDays});
 
-  final Map<String, List<Lesson>> weeklyLessons;
+  final List<WeekDayLessons> weekDays;
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      children: weeklyLessons.entries.map((entry) {
-        final lessons = entry.value;
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Text(
-                entry.key,
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+    const double timeColumnWidth = 108;
+    const double dayColumnWidth = 120;
+    const double slotHeight = 76;
+    final totalHeight = slotHeight * kTimeSlots.length;
+    final totalWidth = timeColumnWidth + dayColumnWidth * weekDays.length;
+    final headerStyle = Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold);
+    final dateStyle = Theme.of(context).textTheme.bodySmall;
+
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+        child: SizedBox(
+          width: totalWidth,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const SizedBox(width: timeColumnWidth),
+                  ...weekDays.map((day) {
+                    final label = _weekdayLabel(day.date.weekday);
+                    final dateText = '${day.date.month}/${day.date.day}';
+                    return SizedBox(
+                      width: dayColumnWidth,
+                      child: Column(
+                        children: [
+                          Text(label, style: headerStyle),
+                          const SizedBox(height: 4),
+                          Text(dateText, style: dateStyle),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                ],
               ),
-            ),
-            if (lessons.isEmpty)
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.05),
-                      blurRadius: 8,
-                      offset: const Offset(0, 4),
+              const SizedBox(height: 12),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: timeColumnWidth,
+                    height: totalHeight,
+                    child: Column(
+                      children: kTimeSlots
+                          .map(
+                            (slot) => SizedBox(
+                              height: slotHeight,
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(slot.label, style: Theme.of(context).textTheme.titleMedium),
+                                  const SizedBox(height: 4),
+                                  Text(slot.timeRange, style: Theme.of(context).textTheme.bodySmall),
+                                ],
+                              ),
+                            ),
+                          )
+                          .toList(),
                     ),
-                  ],
-                ),
-                child: const Text('当天暂无课程，安排自习或休息'),
+                  ),
+                  SizedBox(
+                    width: dayColumnWidth * weekDays.length,
+                    height: totalHeight,
+                    child: Stack(
+                      children: [
+                        for (var dayIndex = 0; dayIndex < weekDays.length; dayIndex++)
+                          for (var i = 0; i < kTimeSlots.length; i++)
+                            Positioned(
+                              left: dayIndex * dayColumnWidth,
+                              top: i * slotHeight,
+                              child: Container(
+                                width: dayColumnWidth,
+                                height: slotHeight,
+                                decoration: BoxDecoration(
+                                  border: Border.all(color: Colors.grey.shade200, width: 1),
+                                ),
+                              ),
+                            ),
+                        for (var dayIndex = 0; dayIndex < weekDays.length; dayIndex++)
+                          ...weekDays[dayIndex].lessons.map((lesson) {
+                            final span = _lessonSpan(lesson, weekDays[dayIndex].date);
+                            if (span == null) return const SizedBox.shrink();
+                            final baseColor = _courseColor(lesson.courseName);
+                            final top = (span.startIndex - 1) * slotHeight + 4;
+                            final height = span.slotCount * slotHeight - 8;
+                            return Positioned(
+                              left: dayIndex * dayColumnWidth + 6,
+                              top: top,
+                              width: dayColumnWidth - 12,
+                              height: height,
+                              child: Container(
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(
+                                  color: baseColor.withOpacity(0.22),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: baseColor.withOpacity(0.55), width: 1.2),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: baseColor.withOpacity(0.18),
+                                      blurRadius: 16,
+                                      offset: const Offset(0, 8),
+                                    ),
+                                  ],
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      lesson.courseName,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .titleSmall
+                                          ?.copyWith(fontWeight: FontWeight.bold),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
+                                      style: Theme.of(context).textTheme.bodySmall,
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(lesson.location, style: Theme.of(context).textTheme.bodySmall),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      lesson.teacher,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(color: Colors.black54),
+                                    ),
+                                    if (lesson.topic.isNotEmpty) ...[
+                                      const SizedBox(height: 2),
+                                      Text('要点：${lesson.topic}', style: Theme.of(context).textTheme.bodySmall),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            );
+                          }),
+                      ],
+                    ),
+                  ),
+                ],
               ),
-            ...lessons.map((lesson) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: _LessonCard(lesson: lesson),
-                )),
-          ],
-        );
-      }).toList(),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -348,69 +434,6 @@ class _UserSettingTile extends StatelessWidget {
   }
 }
 
-class _LessonCard extends StatelessWidget {
-  const _LessonCard({required this.lesson});
-
-  final Lesson lesson;
-
-  @override
-  Widget build(BuildContext context) {
-    final localizations = MaterialLocalizations.of(context);
-    final start = TimeOfDay.fromDateTime(lesson.startTime);
-    final end = TimeOfDay.fromDateTime(lesson.endTime);
-    final timeRange =
-        '${localizations.formatTimeOfDay(start, alwaysUse24HourFormat: true)} - ${localizations.formatTimeOfDay(end, alwaysUse24HourFormat: true)}';
-
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      color: Colors.white,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(lesson.courseName, style: Theme.of(context).textTheme.titleMedium),
-                Chip(
-                  backgroundColor: Theme.of(context).colorScheme.primary.withOpacity(0.1),
-                  label: Text(
-                    lesson.location,
-                    style: TextStyle(color: Theme.of(context).colorScheme.primary),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Icon(Icons.access_time, size: 16),
-                const SizedBox(width: 4),
-                Text(timeRange),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Row(
-              children: [
-                const Icon(Icons.person_outline, size: 16),
-                const SizedBox(width: 4),
-                Text(lesson.teacher),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Text(
-              '课堂要点：${lesson.topic}',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _ScheduleItemCard extends StatelessWidget {
   const _ScheduleItemCard({required this.item});
 
@@ -523,13 +546,20 @@ class ScheduleItem {
   final bool isAuto;
 }
 
+class WeekDayLessons {
+  WeekDayLessons({required this.date, required this.lessons});
+
+  final DateTime date;
+  final List<Lesson> lessons;
+}
+
 class WeeklyScheduleOverview {
   WeeklyScheduleOverview({
-    required this.weeklyLessons,
+    required this.weekDays,
     required this.scheduleItems,
   });
 
-  final Map<String, List<Lesson>> weeklyLessons;
+  final List<WeekDayLessons> weekDays;
   final List<ScheduleItem> scheduleItems;
 }
 
@@ -547,26 +577,23 @@ class ScheduleService {
     final monday = anchorDay.subtract(Duration(days: anchorDay.weekday - 1));
     final weekDays = List.generate(7, (i) => monday.add(Duration(days: i)));
 
-    final Map<String, List<Lesson>> weeklyLessons = {};
+    final List<WeekDayLessons> results = [];
     final List<ReviewTask> allReviewTasks = [];
 
     for (final day in weekDays) {
       final lessons = await _repository.fetchLessonsForDate(day);
-      weeklyLessons[_weekdayLabel(day.weekday)] = lessons;
+      results.add(WeekDayLessons(date: day, lessons: lessons));
       allReviewTasks.addAll(_planner.generatePlan(lessons));
     }
 
     final scheduleItems = _buildScheduleItems(allReviewTasks, anchorDay);
-    return WeeklyScheduleOverview(weeklyLessons: weeklyLessons, scheduleItems: scheduleItems);
+    return WeeklyScheduleOverview(weekDays: results, scheduleItems: scheduleItems);
   }
 
   List<ScheduleItem> _buildScheduleItems(List<ReviewTask> tasks, DateTime anchorDay) {
     final todayStart = DateTime(anchorDay.year, anchorDay.month, anchorDay.day);
     final todayItems = tasks
-        .where((t) =>
-            t.scheduledAt.year == todayStart.year &&
-            t.scheduledAt.month == todayStart.month &&
-            t.scheduledAt.day == todayStart.day)
+        .where((t) => _isSameDay(t.scheduledAt, todayStart))
         .map(
           (t) => ScheduleItem(
             title: '${t.courseName} · 复习',
@@ -577,7 +604,6 @@ class ScheduleService {
         )
         .toList();
 
-    // 示例手动添加日程
     todayItems.addAll([
       ScheduleItem(
         title: '图书馆自习',
@@ -596,27 +622,6 @@ class ScheduleService {
     todayItems.sort((a, b) => a.time.compareTo(b.time));
     return todayItems;
   }
-
-  String _weekdayLabel(int weekday) {
-    switch (weekday) {
-      case DateTime.monday:
-        return '周一';
-      case DateTime.tuesday:
-        return '周二';
-      case DateTime.wednesday:
-        return '周三';
-      case DateTime.thursday:
-        return '周四';
-      case DateTime.friday:
-        return '周五';
-      case DateTime.saturday:
-        return '周六';
-      case DateTime.sunday:
-        return '周日';
-      default:
-        return '周';
-    }
-  }
 }
 
 abstract class ScheduleRepository {
@@ -629,7 +634,6 @@ class MockScheduleRepository implements ScheduleRepository {
     await Future<void>.delayed(const Duration(milliseconds: 240));
     final dayStart = DateTime(date.year, date.month, date.day);
 
-    // 简单示例：周一、三、五有满课，其他较少
     if (date.weekday == DateTime.tuesday) {
       return [
         Lesson(
@@ -722,15 +726,111 @@ class ReviewPlanner {
   }
 
   String? _buildSuggestion(Duration interval) {
-    if (interval.inHours <= 6) {
-      return '快速回顾课堂笔记，标记不确定点。';
-    } else if (interval.inDays <= 1) {
-      return '完成配套习题，检查理解的准确性。';
-    } else if (interval.inDays <= 3) {
-      return '整理错题与难点，尝试讲解给同伴听。';
-    } else if (interval.inDays <= 7) {
-      return '结合记忆曲线回顾核心知识，准备下阶段学习。';
-    }
+    if (interval.inHours <= 6) return '快速回顾课堂笔记，标记不确定点。';
+    if (interval.inDays <= 1) return '完成配套习题，检查理解的准确性。';
+    if (interval.inDays <= 3) return '整理错题与难点，尝试讲解给同伴听。';
+    if (interval.inDays <= 7) return '结合记忆曲线回顾核心知识，准备下阶段学习。';
     return null;
   }
+}
+
+class LessonSpan {
+  LessonSpan({required this.startIndex, required this.slotCount});
+  final int startIndex;
+  final int slotCount;
+}
+
+LessonSpan? _lessonSpan(Lesson lesson, DateTime day) {
+  int? startIdx;
+  int? endIdx;
+  for (var i = 0; i < kTimeSlots.length; i++) {
+    final slot = kTimeSlots[i];
+    final slotStart = DateTime(day.year, day.month, day.day, slot.start.hour, slot.start.minute);
+    final slotEnd = DateTime(day.year, day.month, day.day, slot.end.hour, slot.end.minute);
+    final overlap = lesson.startTime.isBefore(slotEnd) && lesson.endTime.isAfter(slotStart);
+    if (overlap) {
+      startIdx ??= i + 1;
+      endIdx = i + 1;
+    }
+  }
+  if (startIdx == null || endIdx == null) return null;
+  return LessonSpan(startIndex: startIdx, slotCount: endIdx - startIdx + 1);
+}
+
+class TimeSlot {
+  const TimeSlot({
+    required this.index,
+    required this.label,
+    required this.timeRange,
+    required this.start,
+    required this.end,
+  });
+
+  final int index;
+  final String label;
+  final String timeRange;
+  final TimeOfDay start;
+  final TimeOfDay end;
+}
+
+const List<TimeSlot> kTimeSlots = [
+  TimeSlot(index: 1, label: '第1节', timeRange: '08:00-08:45', start: TimeOfDay(hour: 8, minute: 0), end: TimeOfDay(hour: 8, minute: 45)),
+  TimeSlot(index: 2, label: '第2节', timeRange: '08:55-09:40', start: TimeOfDay(hour: 8, minute: 55), end: TimeOfDay(hour: 9, minute: 40)),
+  TimeSlot(index: 3, label: '第3节', timeRange: '10:00-10:45', start: TimeOfDay(hour: 10, minute: 0), end: TimeOfDay(hour: 10, minute: 45)),
+  TimeSlot(index: 4, label: '第4节', timeRange: '10:55-11:40', start: TimeOfDay(hour: 10, minute: 55), end: TimeOfDay(hour: 11, minute: 40)),
+  TimeSlot(index: 5, label: '第5节', timeRange: '12:00-12:45', start: TimeOfDay(hour: 12, minute: 0), end: TimeOfDay(hour: 12, minute: 45)),
+  TimeSlot(index: 6, label: '第6节', timeRange: '12:55-13:40', start: TimeOfDay(hour: 12, minute: 55), end: TimeOfDay(hour: 13, minute: 40)),
+  TimeSlot(index: 7, label: '第7节', timeRange: '14:00-14:45', start: TimeOfDay(hour: 14, minute: 0), end: TimeOfDay(hour: 14, minute: 45)),
+  TimeSlot(index: 8, label: '第8节', timeRange: '14:55-15:40', start: TimeOfDay(hour: 14, minute: 55), end: TimeOfDay(hour: 15, minute: 40)),
+  TimeSlot(index: 9, label: '第9节', timeRange: '16:00-16:45', start: TimeOfDay(hour: 16, minute: 0), end: TimeOfDay(hour: 16, minute: 45)),
+  TimeSlot(index: 10, label: '第10节', timeRange: '16:55-17:40', start: TimeOfDay(hour: 16, minute: 55), end: TimeOfDay(hour: 17, minute: 40)),
+  TimeSlot(index: 11, label: '第11节', timeRange: '18:00-18:45', start: TimeOfDay(hour: 18, minute: 0), end: TimeOfDay(hour: 18, minute: 45)),
+  TimeSlot(index: 12, label: '第12节', timeRange: '18:55-19:40', start: TimeOfDay(hour: 18, minute: 55), end: TimeOfDay(hour: 19, minute: 40)),
+  TimeSlot(index: 13, label: '第13节', timeRange: '19:40-20:20', start: TimeOfDay(hour: 19, minute: 40), end: TimeOfDay(hour: 20, minute: 20)),
+];
+
+String _weekdayLabel(int weekday) {
+  switch (weekday) {
+    case DateTime.monday:
+      return '周一';
+    case DateTime.tuesday:
+      return '周二';
+    case DateTime.wednesday:
+      return '周三';
+    case DateTime.thursday:
+      return '周四';
+    case DateTime.friday:
+      return '周五';
+    case DateTime.saturday:
+      return '周六';
+    case DateTime.sunday:
+      return '周日';
+    default:
+      return '周';
+  }
+}
+
+Color _courseColor(String courseName) {
+  const palette = [
+    Color(0xFF6C63FF),
+    Color(0xFF2EC4B6),
+    Color(0xFFFF9F1C),
+    Color(0xFF6A4C93),
+    Color(0xFF00B4D8),
+    Color(0xFF2D6A4F),
+    Color(0xFFEE6352),
+    Color(0xFF3A86FF),
+  ];
+  final index = courseName.hashCode.abs() % palette.length;
+  return palette[index];
+}
+
+bool _isSameDay(DateTime a, DateTime b) {
+  return a.year == b.year && a.month == b.month && a.day == b.day;
+}
+
+String _formatTime(DateTime time) {
+  final hour = time.hour.toString().padLeft(2, '0');
+  final minute = time.minute.toString().padLeft(2, '0');
+  return '$hour:$minute';
 }
