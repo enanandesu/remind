@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
 void main() {
   runApp(const RemindApp());
@@ -501,6 +502,16 @@ class UserTab extends StatelessWidget {
               ],
             ),
           ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (ctx) => const WebImportPage()),
+              );
+            },
+            icon: const Icon(Icons.web),
+            label: const Text('打开教务网站（i.sjtu.edu.cn）'),
+          ),
           const SizedBox(height: 20),
           Card(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -972,4 +983,51 @@ String _formatTime(DateTime time) {
   final hour = time.hour.toString().padLeft(2, '0');
   final minute = time.minute.toString().padLeft(2, '0');
   return '$hour:$minute';
+}
+
+class WebImportPage extends StatefulWidget {
+  const WebImportPage({super.key});
+
+  @override
+  State<WebImportPage> createState() => _WebImportPageState();
+}
+
+class _WebImportPageState extends State<WebImportPage> {
+  late final WebViewController _controller;
+  double _progress = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onProgress: (value) => setState(() => _progress = value / 100),
+        ),
+      )
+      ..loadRequest(Uri.parse('https://i.sjtu.edu.cn'));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('教务系统'),
+        actions: [
+          IconButton(
+            onPressed: () => _controller.reload(),
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(2),
+          child: _progress < 1
+              ? LinearProgressIndicator(value: _progress)
+              : const SizedBox(height: 2),
+        ),
+      ),
+      body: WebViewWidget(controller: _controller),
+    );
+  }
 }
