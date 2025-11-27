@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 
 void main() {
   runApp(const RemindApp());
@@ -39,6 +39,7 @@ class _HomeShellState extends State<HomeShell> {
   int _currentIndex = 0;
   late final ScheduleService _scheduleService;
   late Future<WeeklyScheduleOverview> _overviewFuture;
+  final GlobalKey<AgendaTabState> _agendaKey = GlobalKey<AgendaTabState>();
 
   @override
   void initState() {
@@ -111,7 +112,7 @@ class _HomeShellState extends State<HomeShell> {
         final overview = snapshot.data!;
         final pages = [
           TimetableTab(weekDays: overview.weekDays),
-          AgendaTab(items: overview.scheduleItems),
+          AgendaTab(key: _agendaKey, items: overview.scheduleItems),
           const UserTab(),
         ];
 
@@ -126,11 +127,16 @@ class _HomeShellState extends State<HomeShell> {
           body: Stack(
             children: [
               gradientBackground,
-              SafeArea(
-                child: IndexedStack(index: _currentIndex, children: pages),
-              ),
+              SafeArea(child: IndexedStack(index: _currentIndex, children: pages)),
             ],
           ),
+          floatingActionButton: _currentIndex == 1
+              ? FloatingActionButton.extended(
+                  onPressed: () => _agendaKey.currentState?.createSchedule(context),
+                  icon: const Icon(Icons.add),
+                  label: const Text('添加日程'),
+                )
+              : null,
           bottomNavigationBar: NavigationBar(
             selectedIndex: _currentIndex,
             onDestinationSelected: (index) => setState(() => _currentIndex = index),
@@ -305,24 +311,142 @@ class TimetableTab extends StatelessWidget {
   }
 }
 
-class AgendaTab extends StatelessWidget {
+class AgendaTab extends StatefulWidget {
   const AgendaTab({super.key, required this.items});
 
   final List<ScheduleItem> items;
 
   @override
+  State<AgendaTab> createState() => AgendaTabState();
+}
+
+class AgendaTabState extends State<AgendaTab> {
+  late List<ScheduleItem> _items;
+
+  @override
+  void initState() {
+    super.initState();
+    _items = List.of(widget.items);
+  }
+
+  void createSchedule(BuildContext context) {
+    _openEditDialog(context);
+  }
+
+  void _openEditDialog(BuildContext context, {ScheduleItem? origin, int? index}) async {
+    final titleCtrl = TextEditingController(text: origin?.title ?? '');
+    final detailCtrl = TextEditingController(text: origin?.detail ?? '');
+    DateTime selected = origin?.time ?? DateTime.now();
+
+    Future<void> pickDateTime() async {
+      final date = await showDatePicker(
+        context: context,
+        initialDate: selected,
+        firstDate: DateTime.now().subtract(const Duration(days: 365)),
+        lastDate: DateTime.now().add(const Duration(days: 365)),
+      );
+      if (date == null) return;
+      final time = await showTimePicker(
+        context: context,
+        initialTime: TimeOfDay.fromDateTime(selected),
+      );
+      if (time == null) return;
+      selected = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    }
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text(origin == null ? '添加日程' : '编辑日程'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '标题')),
+                TextField(controller: detailCtrl, decoration: const InputDecoration(labelText: '详情'), maxLines: 2),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(Icons.schedule, size: 18),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '${selected.year}-${selected.month.toString().padLeft(2, '0')}-${selected.day.toString().padLeft(2, '0')} '
+                        '${selected.hour.toString().padLeft(2, '0')}:${selected.minute.toString().padLeft(2, '0')}',
+                      ),
+                    ),
+                    TextButton(onPressed: pickDateTime, child: const Text('选择时间')),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('保存')),
+          ],
+        );
+      },
+    );
+
+    if (saved != true) return;
+    final newItem = ScheduleItem(
+      title: titleCtrl.text.isEmpty ? '未命名日程' : titleCtrl.text,
+      detail: detailCtrl.text,
+      time: selected,
+      isAuto: false,
+    );
+
+    setState(() {
+      if (index != null) {
+        _items[index] = newItem;
+      } else {
+        _items.add(newItem);
+      }
+      _items.sort((a, b) => a.time.compareTo(b.time));
+    });
+  }
+
+  void _deleteItem(int index) {
+    setState(() {
+      _items.removeAt(index);
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    if (items.isEmpty) {
+    if (_items.isEmpty) {
       return const Center(child: Text('今天没有待办，保持良好作息'));
     }
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
       itemBuilder: (context, index) {
-        final item = items[index];
-        return _ScheduleItemCard(item: item);
+        final item = _items[index];
+        return Dismissible(
+          key: ValueKey('${item.title}-${item.time.toIso8601String()}-$index'),
+          background: Container(
+            color: Colors.red.withOpacity(0.8),
+            alignment: Alignment.centerLeft,
+            padding: const EdgeInsets.only(left: 16),
+            child: const Icon(Icons.delete, color: Colors.white),
+          ),
+          secondaryBackground: Container(
+            color: Colors.red.withOpacity(0.8),
+            alignment: Alignment.centerRight,
+            padding: const EdgeInsets.only(right: 16),
+            child: const Icon(Icons.delete, color: Colors.white),
+          ),
+          onDismissed: (_) => _deleteItem(index),
+          child: _ScheduleItemCard(
+            item: item,
+            onEdit: () => _openEditDialog(context, origin: item, index: index),
+            onDelete: () => _deleteItem(index),
+          ),
+        );
       },
       separatorBuilder: (context, index) => const SizedBox(height: 12),
-      itemCount: items.length,
+      itemCount: _items.length,
     );
   }
 }
@@ -435,9 +559,11 @@ class _UserSettingTile extends StatelessWidget {
 }
 
 class _ScheduleItemCard extends StatelessWidget {
-  const _ScheduleItemCard({required this.item});
+  const _ScheduleItemCard({required this.item, this.onEdit, this.onDelete});
 
   final ScheduleItem item;
+  final VoidCallback? onEdit;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -485,6 +611,19 @@ class _ScheduleItemCard extends StatelessWidget {
                 ],
               ),
             ),
+            PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'edit') {
+                  onEdit?.call();
+                } else if (value == 'delete') {
+                  onDelete?.call();
+                }
+              },
+              itemBuilder: (context) => const [
+                PopupMenuItem(value: 'edit', child: Text('编辑')),
+                PopupMenuItem(value: 'delete', child: Text('删除')),
+              ],
+            )
           ],
         ),
       ),
@@ -608,13 +747,13 @@ class ScheduleService {
       ScheduleItem(
         title: '图书馆自习',
         detail: '完成高数作业 + 预习下一章',
-        time: todayStart.add(const Duration(hours: 19, minutes: 0)),
+        time: todayStart.add(const Duration(hours: 19)),
         isAuto: false,
       ),
       ScheduleItem(
         title: '社团会议',
         detail: '复盘本周活动，安排下周任务',
-        time: todayStart.add(const Duration(hours: 21, minutes: 0)),
+        time: todayStart.add(const Duration(hours: 21)),
         isAuto: false,
       ),
     ]);
@@ -639,7 +778,7 @@ class MockScheduleRepository implements ScheduleRepository {
         Lesson(
           courseName: '职业规划',
           teacher: '周老师',
-          startTime: dayStart.add(const Duration(hours: 10, minutes: 0)),
+          startTime: dayStart.add(const Duration(hours: 10)),
           endTime: dayStart.add(const Duration(hours: 11, minutes: 30)),
           topic: '简历与面试技巧',
           location: '学生中心201',
@@ -652,7 +791,7 @@ class MockScheduleRepository implements ScheduleRepository {
         Lesson(
           courseName: '心理健康',
           teacher: '黄老师',
-          startTime: dayStart.add(const Duration(hours: 15, minutes: 0)),
+          startTime: dayStart.add(const Duration(hours: 15)),
           endTime: dayStart.add(const Duration(hours: 16, minutes: 30)),
           topic: '压力管理与自我调节',
           location: '教学楼C区102',
@@ -668,7 +807,7 @@ class MockScheduleRepository implements ScheduleRepository {
       Lesson(
         courseName: '高等数学',
         teacher: '王老师',
-        startTime: dayStart.add(const Duration(hours: 8, minutes: 0)),
+        startTime: dayStart.add(const Duration(hours: 8)),
         endTime: dayStart.add(const Duration(hours: 9, minutes: 40)),
         topic: '第5章 定积分与应用',
         location: '教学楼A区205',
@@ -684,7 +823,7 @@ class MockScheduleRepository implements ScheduleRepository {
       Lesson(
         courseName: '数据结构',
         teacher: '陈老师',
-        startTime: dayStart.add(const Duration(hours: 14, minutes: 0)),
+        startTime: dayStart.add(const Duration(hours: 14)),
         endTime: dayStart.add(const Duration(hours: 15, minutes: 40)),
         topic: '第3章 栈与队列',
         location: '信息楼C区101',
