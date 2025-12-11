@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
@@ -38,14 +40,16 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _currentIndex = 0;
-  late final ScheduleService _scheduleService;
+  late ScheduleService _scheduleService;
   late Future<WeeklyScheduleOverview> _overviewFuture;
+  late ScheduleRepository _repository;
   final GlobalKey<AgendaTabState> _agendaKey = GlobalKey<AgendaTabState>();
 
   @override
   void initState() {
     super.initState();
-    _scheduleService = ScheduleService();
+    _repository = MockScheduleRepository();
+    _scheduleService = ScheduleService(repository: _repository);
     _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
   }
 
@@ -53,6 +57,29 @@ class _HomeShellState extends State<HomeShell> {
     setState(() {
       _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
     });
+  }
+
+  void _applyImportedLessons(List<Lesson> lessons) {
+    setState(() {
+      _repository = MemoryScheduleRepository(lessons: lessons);
+      _scheduleService = ScheduleService(repository: _repository);
+      _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
+      _currentIndex = 0;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('成功导入${lessons.length}条课程，已替换课表'),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Future<void> _openWebImport() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (ctx) => WebImportPage(onImported: _applyImportedLessons),
+      ),
+    );
   }
 
   @override
@@ -114,7 +141,7 @@ class _HomeShellState extends State<HomeShell> {
         final pages = [
           TimetableTab(weekDays: overview.weekDays),
           AgendaTab(key: _agendaKey, items: overview.scheduleItems),
-          const UserTab(),
+          UserTab(onOpenImport: _openWebImport),
         ];
 
         return Scaffold(
@@ -274,14 +301,23 @@ class TimetableTab extends StatelessWidget {
                                           .textTheme
                                           .titleSmall
                                           ?.copyWith(fontWeight: FontWeight.bold),
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
                                     const SizedBox(height: 4),
                                     Text(
                                       '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
                                       style: Theme.of(context).textTheme.bodySmall,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
                                     const SizedBox(height: 2),
-                                    Text(lesson.location, style: Theme.of(context).textTheme.bodySmall),
+                                    Text(
+                                      lesson.location,
+                                      style: Theme.of(context).textTheme.bodySmall,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
                                     const SizedBox(height: 2),
                                     Text(
                                       lesson.teacher,
@@ -289,10 +325,17 @@ class TimetableTab extends StatelessWidget {
                                           .textTheme
                                           .bodySmall
                                           ?.copyWith(color: Colors.black54),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
                                     if (lesson.topic.isNotEmpty) ...[
                                       const SizedBox(height: 2),
-                                      Text('要点：${lesson.topic}', style: Theme.of(context).textTheme.bodySmall),
+                                      Text(
+                                        '要点：${lesson.topic}',
+                                        style: Theme.of(context).textTheme.bodySmall,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
                                     ],
                                   ],
                                 ),
@@ -453,7 +496,9 @@ class AgendaTabState extends State<AgendaTab> {
 }
 
 class UserTab extends StatelessWidget {
-  const UserTab({super.key});
+  const UserTab({super.key, required this.onOpenImport});
+
+  final VoidCallback onOpenImport;
 
   @override
   Widget build(BuildContext context) {
@@ -504,11 +549,7 @@ class UserTab extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           ElevatedButton.icon(
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(builder: (ctx) => const WebImportPage()),
-              );
-            },
+            onPressed: onOpenImport,
             icon: const Icon(Icons.web),
             label: const Text('打开教务网站（i.sjtu.edu.cn）'),
           ),
@@ -843,6 +884,21 @@ class MockScheduleRepository implements ScheduleRepository {
   }
 }
 
+class MemoryScheduleRepository implements ScheduleRepository {
+  MemoryScheduleRepository({required List<Lesson> lessons})
+      : _lessons = List.of(lessons);
+
+  final List<Lesson> _lessons;
+
+  @override
+  Future<List<Lesson>> fetchLessonsForDate(DateTime date) async {
+    final target = DateTime(date.year, date.month, date.day);
+    return _lessons
+        .where((lesson) => _isSameDay(lesson.startTime, target))
+        .toList();
+  }
+}
+
 class ReviewPlanner {
   ReviewPlanner({List<Duration>? reviewIntervals})
       : reviewIntervals = reviewIntervals ??
@@ -986,7 +1042,9 @@ String _formatTime(DateTime time) {
 }
 
 class WebImportPage extends StatefulWidget {
-  const WebImportPage({super.key});
+  const WebImportPage({super.key, required this.onImported});
+
+  final ValueChanged<List<Lesson>> onImported;
 
   @override
   State<WebImportPage> createState() => _WebImportPageState();
@@ -995,6 +1053,10 @@ class WebImportPage extends StatefulWidget {
 class _WebImportPageState extends State<WebImportPage> {
   late final WebViewController _controller;
   double _progress = 0;
+  bool _isExtracting = false;
+  List<Map<String, dynamic>> _scrapedCourses = [];
+  String? _lastError;
+  List<Lesson> _parsedLessons = [];
 
   @override
   void initState() {
@@ -1027,7 +1089,229 @@ class _WebImportPageState extends State<WebImportPage> {
               : const SizedBox(height: 2),
         ),
       ),
-      body: WebViewWidget(controller: _controller),
+      body: Column(
+        children: [
+          Expanded(child: WebViewWidget(controller: _controller)),
+          _buildResultPanel(),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _isExtracting ? null : _extractCourses,
+        icon: _isExtracting ? const CircularProgressIndicator() : const Icon(Icons.download),
+        label: Text(_isExtracting ? '抓取中...' : '提取课程'),
+      ),
     );
   }
+
+  Widget _buildResultPanel() {
+    if (_lastError != null) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        color: Colors.red.withOpacity(0.1),
+        child: Text('抓取失败：$_lastError'),
+      );
+    }
+    if (_scrapedCourses.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        color: Colors.grey.shade200,
+        child: const Text('提示：登录后打开课表页面，点击“提取课程”即可抓取。'),
+      );
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          height: 200,
+          child: ListView.builder(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            itemCount: _scrapedCourses.length,
+            itemBuilder: (context, index) {
+              final course = _scrapedCourses[index];
+              final info = course['info'] as Map<String, dynamic>? ?? {};
+              return Card(
+                child: ListTile(
+                  title: Text(course['title'] ?? '课程'),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: info.entries.map((e) => Text('${e.key}：${e.value}')).toList(),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: ElevatedButton.icon(
+            onPressed: _parsedLessons.isEmpty ? null : _importToApp,
+            icon: const Icon(Icons.check_circle_outline),
+            label: Text('导入到课表（${_parsedLessons.length}条）'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _extractCourses() async {
+    const script = r'''
+      (function() {
+        const cells = Array.from(document.querySelectorAll('.timetable_con'));
+        const rows = cells.map(cell => {
+          const title = (cell.querySelector('.title')?.innerText || '').replace(/\s+/g, ' ').trim();
+          const info = {};
+          cell.querySelectorAll('p').forEach(p => {
+            const label = p.querySelector('[data-toggle="tooltip"]')?.getAttribute('title') || '';
+            const value = p.innerText.replace(/\s+/g, ' ').trim();
+            if (label && value) {
+              info[label] = value;
+            }
+          });
+          const td = cell.closest('td');
+          const rowSpan = td?.getAttribute('rowspan') || '';
+          const colSpan = td?.getAttribute('colspan') || '';
+          const id = td?.getAttribute('id') || '';
+          let columnIndex = null;
+          if (td && td.parentElement) {
+            columnIndex = Array.from(td.parentElement.children).indexOf(td);
+          }
+          return {
+            title,
+            rowSpan,
+            colSpan,
+            id,
+            columnIndex,
+            info,
+          };
+        });
+        return JSON.stringify(rows);
+      })();
+    ''';
+
+    setState(() {
+      _isExtracting = true;
+      _lastError = null;
+    });
+
+    try {
+      final rawResult = await _controller.runJavaScriptReturningResult(script);
+      final raw = rawResult.toString().trim();
+      final normalized = raw.startsWith('"') && raw.endsWith('"')
+          ? jsonDecode(raw) as String
+          : raw;
+      final decoded = jsonDecode(normalized) as List<dynamic>;
+      setState(() {
+        _scrapedCourses =
+            decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+        _parsedLessons = _convertToLessons(_scrapedCourses);
+      });
+    } catch (e) {
+      setState(() {
+        _lastError = e.toString();
+        _scrapedCourses = [];
+        _parsedLessons = [];
+      });
+    } finally {
+      setState(() {
+        _isExtracting = false;
+      });
+    }
+  }
+
+  void _importToApp() {
+    if (_parsedLessons.isEmpty) return;
+    widget.onImported(_parsedLessons);
+    if (mounted) {
+      Navigator.pop(context);
+    }
+  }
+
+  List<Lesson> _convertToLessons(List<Map<String, dynamic>> rawCourses) {
+    final monday = _currentWeekMonday();
+    final results = <Lesson>[];
+    for (final course in rawCourses) {
+      final lesson = _mapCourseToLesson(course, monday);
+      if (lesson != null) {
+        results.add(lesson);
+      }
+    }
+    return results;
+  }
+
+  Lesson? _mapCourseToLesson(Map<String, dynamic> course, DateTime monday) {
+    final info = Map<String, dynamic>.from(course['info'] as Map? ?? {});
+    final rowSpan = int.tryParse('${course['rowSpan'] ?? ''}');
+    final slotText = info['节/周'] as String? ?? info['节次'] as String?;
+    final slotRange = _parseSlotRange(slotText, rowSpan: rowSpan);
+    final dayOffset = _parseDayOffset(course['columnIndex']);
+    if (slotRange == null || dayOffset == null) return null;
+    final startSlot = _slotByIndex(slotRange.start);
+    final endSlot = _slotByIndex(slotRange.end);
+    if (startSlot == null || endSlot == null) return null;
+
+    final date = monday.add(Duration(days: dayOffset));
+    final startTime = DateTime(date.year, date.month, date.day, startSlot.start.hour, startSlot.start.minute);
+    final endTime = DateTime(date.year, date.month, date.day, endSlot.end.hour, endSlot.end.minute);
+
+    return Lesson(
+      courseName: _cleanText(course['title'] ?? info['教学班名称'] ?? '课程'),
+      teacher: _cleanText(info['教师']),
+      startTime: startTime,
+      endTime: endTime,
+      topic: _cleanText(info['课程标记'] ?? info['选课备注'] ?? info['节/周']),
+      location: _cleanText(info['上课地点']),
+    );
+  }
+
+  DateTime _currentWeekMonday() {
+    final now = DateTime.now();
+    return now.subtract(Duration(days: now.weekday - 1));
+  }
+
+  int? _parseDayOffset(dynamic columnIndex) {
+    if (columnIndex == null) return null;
+    final index = columnIndex is num ? columnIndex.toInt() : int.tryParse(columnIndex.toString());
+    if (index == null) return null;
+    final offset = index - 1;
+    if (offset < 0 || offset > 6) return null;
+    return offset;
+  }
+
+  _SlotRange? _parseSlotRange(String? text, {int? rowSpan}) {
+    if (text == null) return null;
+    final normalized = text.replaceAll('（', '(').replaceAll('）', ')');
+    final rangeMatch = RegExp(r'(\d+)\s*-\s*(\d+)节').firstMatch(normalized);
+    if (rangeMatch != null) {
+      final start = int.parse(rangeMatch.group(1)!);
+      final end = int.parse(rangeMatch.group(2)!);
+      return _SlotRange(start, end);
+    }
+    final singleMatch = RegExp(r'(\d+)节').firstMatch(normalized);
+    if (singleMatch != null) {
+      final start = int.parse(singleMatch.group(1)!);
+      final count = rowSpan ?? 1;
+      return _SlotRange(start, start + count - 1);
+    }
+    return null;
+  }
+
+  TimeSlot? _slotByIndex(int index) {
+    for (final slot in kTimeSlots) {
+      if (slot.index == index) return slot;
+    }
+    return null;
+  }
+
+  String _cleanText(dynamic value) {
+    if (value == null) return '';
+    return value.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+}
+
+class _SlotRange {
+  _SlotRange(this.start, this.end);
+  final int start;
+  final int end;
 }
