@@ -499,8 +499,9 @@ class AgendaTabState extends State<AgendaTab> {
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
       itemBuilder: (context, index) {
         final item = _items[index];
+        final itemKey = ValueKey('${item.title}-${item.time.toIso8601String()}');
         return Dismissible(
-          key: ValueKey('${item.title}-${item.time.toIso8601String()}-$index'),
+          key: itemKey,
           background: Container(
             color: Colors.red.withOpacity(0.8),
             alignment: Alignment.centerLeft,
@@ -513,7 +514,12 @@ class AgendaTabState extends State<AgendaTab> {
             padding: const EdgeInsets.only(right: 16),
             child: const Icon(Icons.delete, color: Colors.white),
           ),
-          onDismissed: (_) => _deleteItem(index),
+          confirmDismiss: (_) async {
+            setState(() {
+              _items.removeWhere((element) => element == item);
+            });
+            return true;
+          },
           child: _ScheduleItemCard(
             item: item,
             onEdit: () => _openEditDialog(context, origin: item, index: index),
