@@ -1425,8 +1425,12 @@ class _WebImportPageState extends State<WebImportPage> {
           const colSpan = td?.getAttribute('colspan') || '';
           const id = td?.getAttribute('id') || '';
           let columnIndex = null;
-          if (td && td.parentElement) {
-            columnIndex = Array.from(td.parentElement.children).indexOf(td);
+          if (td) {
+            const row = td.closest('tr');
+            if (row) {
+              const wrapCells = Array.from(row.querySelectorAll('td.td_wrap'));
+              columnIndex = wrapCells.indexOf(td);
+            }
           }
           return {
             title,
@@ -1496,7 +1500,7 @@ class _WebImportPageState extends State<WebImportPage> {
     final rowSpan = int.tryParse('${course['rowSpan'] ?? ''}');
     final slotText = _firstText(info['节/周']) ?? _firstText(info['节次']);
     final slotRange = _parseSlotRange(slotText, rowSpan: rowSpan);
-    final dayOffset = _parseDayOffset(course['columnIndex']);
+    final dayOffset = _parseDayOffset(course['columnIndex'], course['id'] as String?);
     if (slotRange == null || dayOffset == null) return null;
     final startSlot = _slotByIndex(slotRange.start);
     final endSlot = _slotByIndex(slotRange.end);
@@ -1529,13 +1533,37 @@ class _WebImportPageState extends State<WebImportPage> {
     return now.subtract(Duration(days: now.weekday - 1));
   }
 
-  int? _parseDayOffset(dynamic columnIndex) {
+  int? _parseDayOffset(dynamic columnIndex, String? cellId) {
+    final normalized = _normalizeColumnIndex(columnIndex);
+    if (normalized != null && normalized >= 0 && normalized <= 6) {
+      return normalized;
+    }
+    final idDay = _parseCellIdDay(cellId);
+    if (idDay != null && idDay >= 0 && idDay <= 6) {
+      return idDay;
+    }
+    return null;
+  }
+
+  int? _normalizeColumnIndex(dynamic columnIndex) {
     if (columnIndex == null) return null;
-    final index = columnIndex is num ? columnIndex.toInt() : int.tryParse(columnIndex.toString());
-    if (index == null) return null;
-    final offset = index - 2;
-    if (offset < 0 || offset > 6) return null;
-    return offset;
+    final raw = columnIndex is num ? columnIndex.toInt() : int.tryParse(columnIndex.toString());
+    if (raw == null) return null;
+    if (raw >= 0 && raw <= 6) return raw;
+    if (raw >= 1 && raw <= 7) return raw - 1;
+    if (raw >= 2 && raw <= 8) return raw - 2;
+    return null;
+  }
+
+  int? _parseCellIdDay(String? cellId) {
+    if (cellId == null) return null;
+    final match = RegExp(r'(\d+)[-_](\d+)').firstMatch(cellId);
+    if (match == null) return null;
+    final col = int.tryParse(match.group(2)!);
+    if (col == null) return null;
+    if (col >= 1 && col <= 7) return col - 1;
+    if (col >= 0 && col <= 6) return col;
+    return null;
   }
 
   _SlotRange? _parseSlotRange(String? text, {int? rowSpan}) {
