@@ -187,170 +187,202 @@ class TimetableTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const double timeColumnWidth = 108;
-    const double dayColumnWidth = 120;
-    const double slotHeight = 76;
+    const double timeColumnWidth = 84;
+    const double slotHeight = 84;
+    const double pagePadding = 16;
+    const double minDayColumnWidth = 110;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final screenWidth = constraints.maxWidth;
+        final dayCount = weekDays.isEmpty ? 1 : weekDays.length;
+        final available = (screenWidth - pagePadding * 2 - timeColumnWidth).clamp(0, double.infinity);
+        final fittedWidth = available / dayCount;
+        final dayColumnWidth = fittedWidth < minDayColumnWidth ? minDayColumnWidth : fittedWidth;
+        final tableWidth = timeColumnWidth + dayColumnWidth * dayCount;
+        final needsHorizontal = tableWidth + pagePadding * 2 > screenWidth;
+
+        final table = Padding(
+          padding: const EdgeInsets.symmetric(horizontal: pagePadding),
+          child: SizedBox(
+            width: tableWidth,
+            child: _TimetableContent(
+              weekDays: weekDays,
+              timeColumnWidth: timeColumnWidth,
+              dayColumnWidth: dayColumnWidth,
+              slotHeight: slotHeight,
+            ),
+          ),
+        );
+
+        return SingleChildScrollView(
+          padding: const EdgeInsets.only(bottom: 24),
+          child: needsHorizontal ? SingleChildScrollView(scrollDirection: Axis.horizontal, child: table) : Center(child: table),
+        );
+      },
+    );
+  }
+}
+
+class _TimetableContent extends StatelessWidget {
+  const _TimetableContent({
+    required this.weekDays,
+    required this.timeColumnWidth,
+    required this.dayColumnWidth,
+    required this.slotHeight,
+  });
+
+  final List<WeekDayLessons> weekDays;
+  final double timeColumnWidth;
+  final double dayColumnWidth;
+  final double slotHeight;
+  @override
+  Widget build(BuildContext context) {
     final totalHeight = slotHeight * kTimeSlots.length;
-    final totalWidth = timeColumnWidth + dayColumnWidth * weekDays.length;
     final headerStyle = Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold);
     final dateStyle = Theme.of(context).textTheme.bodySmall;
 
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
-        child: SizedBox(
-          width: totalWidth,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const SizedBox(width: timeColumnWidth),
-                  ...weekDays.map((day) {
-                    final label = _weekdayLabel(day.date.weekday);
-                    final dateText = '${day.date.month}/${day.date.day}';
-                    return SizedBox(
-                      width: dayColumnWidth,
-                      child: Column(
-                        children: [
-                          Text(label, style: headerStyle),
-                          const SizedBox(height: 4),
-                          Text(dateText, style: dateStyle),
-                        ],
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            SizedBox(width: timeColumnWidth),
+            ...weekDays.map((day) {
+              final label = _weekdayLabel(day.date.weekday);
+              final dateText = '${day.date.month}/${day.date.day}';
+              return SizedBox(
+                width: dayColumnWidth,
+                child: Column(
+                  children: [
+                    Text(label, style: headerStyle),
+                    const SizedBox(height: 4),
+                    Text(dateText, style: dateStyle),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: timeColumnWidth,
+              height: totalHeight,
+              child: Column(
+                children: kTimeSlots
+                    .map(
+                      (slot) => SizedBox(
+                        height: slotHeight,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(slot.label, style: Theme.of(context).textTheme.titleMedium),
+                            const SizedBox(height: 4),
+                            Text(slot.timeRange, style: Theme.of(context).textTheme.bodySmall),
+                          ],
+                        ),
                       ),
-                    );
-                  }).toList(),
-                ],
+                    )
+                    .toList(),
               ),
-              const SizedBox(height: 12),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
+            ),
+            SizedBox(
+              width: dayColumnWidth * weekDays.length,
+              height: totalHeight,
+              child: Stack(
                 children: [
-                  SizedBox(
-                    width: timeColumnWidth,
-                    height: totalHeight,
-                    child: Column(
-                      children: kTimeSlots
-                          .map(
-                            (slot) => SizedBox(
-                              height: slotHeight,
+                  for (var dayIndex = 0; dayIndex < weekDays.length; dayIndex++)
+                    for (var i = 0; i < kTimeSlots.length; i++)
+                      Positioned(
+                        left: dayIndex * dayColumnWidth,
+                        top: i * slotHeight,
+                        child: Container(
+                          width: dayColumnWidth,
+                          height: slotHeight,
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey.shade200, width: 1),
+                          ),
+                        ),
+                      ),
+                  for (var dayIndex = 0; dayIndex < weekDays.length; dayIndex++)
+                    ...weekDays[dayIndex].lessons.map((lesson) {
+                      final span = _lessonSpan(lesson, weekDays[dayIndex].date);
+                      if (span == null) return const SizedBox.shrink();
+                      final baseColor = _courseColor(lesson.courseName);
+                      final top = (span.startIndex - 1) * slotHeight + 4;
+                      final height = span.slotCount * slotHeight - 8;
+                          final textTheme = Theme.of(context).textTheme;
+                          return Positioned(
+                            left: dayIndex * dayColumnWidth + 6,
+                            top: top,
+                            width: dayColumnWidth - 12,
+                            height: height,
+                            child: Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: baseColor.withOpacity(0.22),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: baseColor.withOpacity(0.55), width: 1.2),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: baseColor.withOpacity(0.18),
+                                    blurRadius: 16,
+                                    offset: const Offset(0, 8),
+                                  ),
+                                ],
+                              ),
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  Text(slot.label, style: Theme.of(context).textTheme.titleMedium),
+                                  Text(
+                                    lesson.courseName,
+                                    style: textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold, fontSize: 12),
+                                    maxLines: 3,
+                                    softWrap: true,
+                                  ),
                                   const SizedBox(height: 4),
-                                  Text(slot.timeRange, style: Theme.of(context).textTheme.bodySmall),
+                                  Text(
+                                    '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
+                                    style: textTheme.bodySmall?.copyWith(fontSize: 11),
+                                    maxLines: 2,
+                                    softWrap: true,
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    lesson.location,
+                                    style: textTheme.bodySmall?.copyWith(fontSize: 11),
+                                    maxLines: 2,
+                                    softWrap: true,
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    lesson.teacher,
+                                    style: textTheme.bodySmall?.copyWith(color: Colors.black54, fontSize: 11),
+                                    softWrap: true,
+                                  ),
+                                  if (lesson.topic.isNotEmpty) ...[
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      '要点：${lesson.topic}',
+                                      style: textTheme.bodySmall?.copyWith(fontSize: 11),
+                                      maxLines: 3,
+                                      softWrap: true,
+                                    ),
+                                  ],
                                 ],
                               ),
-                            ),
-                          )
-                          .toList(),
-                    ),
-                  ),
-                  SizedBox(
-                    width: dayColumnWidth * weekDays.length,
-                    height: totalHeight,
-                    child: Stack(
-                      children: [
-                        for (var dayIndex = 0; dayIndex < weekDays.length; dayIndex++)
-                          for (var i = 0; i < kTimeSlots.length; i++)
-                            Positioned(
-                              left: dayIndex * dayColumnWidth,
-                              top: i * slotHeight,
-                              child: Container(
-                                width: dayColumnWidth,
-                                height: slotHeight,
-                                decoration: BoxDecoration(
-                                  border: Border.all(color: Colors.grey.shade200, width: 1),
-                                ),
-                              ),
-                            ),
-                        for (var dayIndex = 0; dayIndex < weekDays.length; dayIndex++)
-                          ...weekDays[dayIndex].lessons.map((lesson) {
-                            final span = _lessonSpan(lesson, weekDays[dayIndex].date);
-                            if (span == null) return const SizedBox.shrink();
-                            final baseColor = _courseColor(lesson.courseName);
-                            final top = (span.startIndex - 1) * slotHeight + 4;
-                            final height = span.slotCount * slotHeight - 8;
-                            return Positioned(
-                              left: dayIndex * dayColumnWidth + 6,
-                              top: top,
-                              width: dayColumnWidth - 12,
-                              height: height,
-                              child: Container(
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: baseColor.withOpacity(0.22),
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(color: baseColor.withOpacity(0.55), width: 1.2),
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: baseColor.withOpacity(0.18),
-                                      blurRadius: 16,
-                                      offset: const Offset(0, 8),
-                                    ),
-                                  ],
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      lesson.courseName,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleSmall
-                                          ?.copyWith(fontWeight: FontWeight.bold),
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
-                                      style: Theme.of(context).textTheme.bodySmall,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      lesson.location,
-                                      style: Theme.of(context).textTheme.bodySmall,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      lesson.teacher,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodySmall
-                                          ?.copyWith(color: Colors.black54),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    if (lesson.topic.isNotEmpty) ...[
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        '要点：${lesson.topic}',
-                                        style: Theme.of(context).textTheme.bodySmall,
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                            );
-                          }),
-                      ],
-                    ),
-                  ),
+                        ),
+                      );
+                    }),
                 ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
-      ),
+      ],
     );
   }
 }
@@ -503,83 +535,76 @@ class UserTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = Theme.of(context).colorScheme;
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 24, 16, 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(16),
-              gradient: LinearGradient(
-                colors: [color.primary, color.secondary],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
+    final secondaryText = Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.white70);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
+      children: [
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(20),
+            gradient: LinearGradient(
+              colors: [color.primary, color.secondary],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: color.primary.withOpacity(0.25),
+                blurRadius: 16,
+                offset: const Offset(0, 8),
               ),
-            ),
-            child: Row(
-              children: [
-                CircleAvatar(
-                  radius: 28,
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '导入课程表',
+                style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '在内置 WebView 登录教务系统，自动抓取并更新课堂信息，生成智能复习计划。',
+                style: secondaryText,
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.white,
-                  child: Icon(Icons.person_outline, size: 32, color: color.primary),
+                  foregroundColor: color.primary,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: const [
-                      Text('未登录', style: TextStyle(color: Colors.white, fontSize: 18)),
-                      SizedBox(height: 6),
-                      Text('登录后同步课表与复习计划', style: TextStyle(color: Colors.white70)),
-                    ],
-                  ),
-                ),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.white,
-                    foregroundColor: color.primary,
-                  ),
-                  onPressed: () {},
-                  child: const Text('登录'),
-                ),
-              ],
-            ),
+                onPressed: onOpenImport,
+                icon: const Icon(Icons.cloud_download_outlined),
+                label: const Text('打开教务网站并导入'),
+              ),
+              const SizedBox(height: 6),
+              Text('支持 i.sjtu.edu.cn', style: secondaryText),
+            ],
           ),
-          const SizedBox(height: 16),
-          ElevatedButton.icon(
-            onPressed: onOpenImport,
-            icon: const Icon(Icons.web),
-            label: const Text('打开教务网站（i.sjtu.edu.cn）'),
+        ),
+        const SizedBox(height: 24),
+        Card(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: Column(
+            children: [
+              const _UserSettingTile(
+                icon: Icons.notifications_active_outlined,
+                title: '提醒设置',
+                subtitle: '设置复习提醒与免打扰时段',
+              ),
+              const Divider(height: 1),
+              const _UserSettingTile(
+                icon: Icons.palette_outlined,
+                title: '主题风格',
+                subtitle: '选择浅色/深色模式和强调色',
+              ),
+            ],
           ),
-          const SizedBox(height: 20),
-          Card(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            child: Column(
-              children: const [
-                _UserSettingTile(
-                  icon: Icons.notifications_active_outlined,
-                  title: '提醒设置',
-                  subtitle: '开启每日复习提醒，支持静音时间段',
-                ),
-                Divider(height: 1),
-                _UserSettingTile(
-                  icon: Icons.schedule_outlined,
-                  title: '导入课表',
-                  subtitle: '支持教务抓取或课程表文件导入',
-                ),
-                Divider(height: 1),
-                _UserSettingTile(
-                  icon: Icons.palette_outlined,
-                  title: '主题风格',
-                  subtitle: '选择浅色/深色和强调色',
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }
@@ -589,11 +614,13 @@ class _UserSettingTile extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.subtitle,
+    this.onTap,
   });
 
   final IconData icon;
   final String title;
   final String subtitle;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -604,8 +631,8 @@ class _UserSettingTile extends StatelessWidget {
       ),
       title: Text(title),
       subtitle: Text(subtitle),
-      trailing: const Icon(Icons.chevron_right),
-      onTap: () {},
+      trailing: onTap == null ? null : const Icon(Icons.chevron_right),
+      onTap: onTap,
     );
   }
 }
