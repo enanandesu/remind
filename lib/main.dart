@@ -574,8 +574,9 @@ class _TimetableContent extends StatelessWidget {
                       final textTheme = Theme.of(context).textTheme;
                       final storedSummary = lessonSummaries[lessonStorageKey(lesson)];
                       final summaryText = storedSummary?.trim();
-                      final remark = (summaryText != null && summaryText.isNotEmpty)
-                          ? summaryText
+                      final bool hasCapturedSummary = summaryText != null && summaryText.isNotEmpty;
+                      final remark = hasCapturedSummary
+                          ? '已抓取内容，等待 AI 提炼'
                           : _formatLessonRemark(lesson.topic);
                       final bool isActive = currentWeekNumber == null
                           ? true
@@ -698,7 +699,6 @@ class _TimetableContent extends StatelessWidget {
   ) {
     final hasCaptured = capturedSummary != null && capturedSummary.trim().isNotEmpty;
     final fallbackRemark = _formatLessonRemark(lesson.topic);
-    final displayText = hasCaptured ? capturedSummary!.trim() : fallbackRemark;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -757,19 +757,28 @@ class _TimetableContent extends StatelessWidget {
                   ],
                 ),
               const SizedBox(height: 12),
-              if (displayText != null)
+              if (hasCaptured)
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      hasCaptured ? '课堂要点（已抓取）' : '课堂要点',
+                      '课堂要点（已抓取，待 AI 提炼）',
                       style: Theme.of(ctx).textTheme.titleMedium,
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      displayText,
+                      '原始课堂内容已抓取完毕，待 AI 分析后会在此展示摘要。',
                       style: Theme.of(ctx).textTheme.bodyMedium,
                     ),
+                  ],
+                )
+              else if (fallbackRemark != null)
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('课堂要点', style: Theme.of(ctx).textTheme.titleMedium),
+                    const SizedBox(height: 8),
+                    Text(fallbackRemark, style: Theme.of(ctx).textTheme.bodyMedium),
                   ],
                 )
               else
@@ -782,22 +791,36 @@ class _TimetableContent extends StatelessWidget {
                   ],
                 ),
               const SizedBox(height: 12),
-              FilledButton.icon(
-                onPressed: () {
-                  Navigator.of(ctx).pop();
-                  onCaptureLesson(lesson);
-                },
-                icon: Icon(hasCaptured ? Icons.add_circle_outline : Icons.play_arrow_rounded),
-                label: Text(hasCaptured ? '补充抓取 / 增加细节' : '去抓取'),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size.fromHeight(44),
+                    ),
+                    onPressed: () {
+                      Navigator.of(ctx).pop();
+                      onCaptureLesson(lesson);
+                    },
+                    icon: Icon(hasCaptured ? Icons.add_circle_outline : Icons.play_arrow_rounded),
+                    label: Text(hasCaptured ? '补充抓取 / 增加细节' : '去抓取'),
+                  ),
+                  if (hasCaptured) ...[
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size.fromHeight(44),
+                      ),
+                      onPressed: () {
+                        Navigator.of(ctx).pop();
+                        onCaptureLesson(lesson);
+                      },
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('重新抓取'),
+                    ),
+                  ],
+                ],
               ),
-              if (hasCaptured)
-                TextButton(
-                  onPressed: () {
-                    Navigator.of(ctx).pop();
-                    onCaptureLesson(lesson);
-                  },
-                  child: const Text('重新抓取 / 覆盖原文'),
-                ),
             ],
           ),
         );
@@ -2016,13 +2039,18 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
   late final WebViewController _controller;
   double _progress = 0;
   bool _isCapturing = false;
-  final List<String> _segments = [];
+  final List<_CapturePiece> _segments = [];
 
   @override
   void initState() {
     super.initState();
     if (widget.initialSummary != null && widget.initialSummary!.trim().isNotEmpty) {
-      _segments.add(widget.initialSummary!.trim());
+      _segments.add(
+        _CapturePiece(
+          isImage: false,
+          content: widget.initialSummary!.trim(),
+        ),
+      );
     }
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -2153,23 +2181,56 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
       );
     }
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxHeight: 180),
+      constraints: const BoxConstraints(maxHeight: 220),
       child: ListView.separated(
         shrinkWrap: true,
         itemCount: _segments.length,
         itemBuilder: (context, index) {
-          final text = _segments[index];
+          final piece = _segments[index];
           return Card(
-            child: ListTile(
-              title: Text('片段 ${index + 1}'),
-              subtitle: Text(
-                text,
-                maxLines: 4,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: IconButton(
-                icon: const Icon(Icons.delete_outline),
-                onPressed: () => setState(() => _segments.removeAt(index)),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(piece.isImage ? Icons.photo_outlined : Icons.notes_outlined, size: 18),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          piece.isImage ? 'PPT 图片片段' : '语音文本片段',
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                      ),
+                      if (piece.timeLabel != null)
+                        Text(piece.timeLabel!, style: Theme.of(context).textTheme.bodySmall),
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline),
+                        onPressed: () => setState(() => _segments.removeAt(index)),
+                      )
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  piece.isImage
+                      ? ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.network(
+                            piece.content,
+                            height: 140,
+                            width: double.infinity,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Text(
+                              piece.content,
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ),
+                        )
+                      : Text(
+                          piece.content,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                ],
               ),
             ),
           );
@@ -2182,19 +2243,26 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
   Future<void> _captureFromWeb() async {
     const script = r'''
       (function() {
-        const candidates = [
-          document.querySelector('.detail-content'),
-          document.querySelector('.course-content'),
-          document.querySelector('.el-main'),
-          document.querySelector('#app'),
-          document.body
-        ];
-        for (const node of candidates) {
-          if (node && node.innerText && node.innerText.trim().length > 0) {
-            return node.innerText;
-          }
+        function textOf(node) {
+          return node && node.innerText ? node.innerText.trim() : '';
         }
-        return '';
+        const captionCards = Array.from(document.querySelectorAll('.caption-scroll-wrapper .caption-card'));
+        const captions = captionCards.map(card => ({
+          time: textOf(card.querySelector('.time-wrapper')),
+          text: textOf(card.querySelector('.caption-text .part') || card.querySelector('.caption-text')),
+        })).filter(item => item.text);
+
+        const imageCards = Array.from(document.querySelectorAll('.ppt-card .el-image_inner img, .ppt-card .el-image img'));
+        const images = imageCards.map(img => {
+          const card = img.closest('.ppt-card');
+          const timeNode = card ? card.querySelector('.time') : null;
+          return {
+            src: img.getAttribute('src') || '',
+            time: textOf(timeNode),
+          };
+        }).filter(item => item.src);
+
+        return JSON.stringify({captions, images});
       })();
     ''';
     setState(() => _isCapturing = true);
@@ -2204,12 +2272,57 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
       if (normalized.isEmpty) {
         throw Exception('未获取到可用文字，请尝试展开课程内容或手动补充');
       }
+      final decoded = jsonDecode(normalized) as Map<String, dynamic>;
+      final captionList = (decoded['captions'] as List<dynamic>? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .where((e) => (e['text'] as String?)?.trim().isNotEmpty ?? false)
+          .toList();
+      final imageList = (decoded['images'] as List<dynamic>? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .where((e) => (e['src'] as String?)?.trim().isNotEmpty ?? false)
+          .toList();
+
+      if (captionList.isEmpty && imageList.isEmpty) {
+        throw Exception('网页结构中未找到字幕或 PPT 图片，请确认已打开“语音”与 PPT 栏目。');
+      }
+
+      final combinedCaption = captionList
+          .map((c) {
+            final time = (c['time'] as String?)?.trim();
+            final text = (c['text'] as String).trim();
+            if (text.isEmpty) return '';
+            return time != null && time.isNotEmpty ? '[$time] $text' : text;
+          })
+          .where((line) => line.isNotEmpty)
+          .join('\n');
+
       setState(() {
-        _segments.add(normalized);
+        if (combinedCaption.isNotEmpty) {
+          _segments.add(
+            _CapturePiece(
+              isImage: false,
+              content: combinedCaption,
+            ),
+          );
+        }
+        for (final img in imageList) {
+          _segments.add(
+            _CapturePiece(
+              isImage: true,
+              content: (img['src'] as String).trim(),
+              time: (img['time'] as String?)?.trim(),
+            ),
+          );
+        }
       });
       if (mounted) {
+        final captionSummary = captionList.isEmpty
+            ? '未找到字幕'
+            : '字幕 ${captionList.length} 条，已合并为 1 段';
+        final imageSummary =
+            imageList.isEmpty ? '未找到 PPT 图片' : 'PPT 图片 ${imageList.length} 张';
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已抓取片段 ${_segments.length}')),
+          SnackBar(content: Text('$captionSummary；$imageSummary')),
         );
       }
     } catch (e) {
@@ -2247,7 +2360,12 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
     );
     if (saved == true && controller.text.trim().isNotEmpty) {
       setState(() {
-        _segments.add(controller.text.trim());
+        _segments.add(
+          _CapturePiece(
+            isImage: false,
+            content: controller.text.trim(),
+          ),
+        );
       });
     }
   }
@@ -2259,7 +2377,25 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
       );
       return;
     }
-    Navigator.of(context).pop(_segments.join('\n\n'));
+    final textPieces = _segments.where((e) => !e.isImage).toList();
+    final imagePieces = _segments.where((e) => e.isImage).toList();
+    final buffer = StringBuffer();
+    if (textPieces.isNotEmpty) {
+      buffer.writeln('【语音摘录】');
+      for (final piece in textPieces) {
+        final time = piece.timeLabel != null ? '[${piece.timeLabel}] ' : '';
+        buffer.writeln('$time${piece.content}');
+      }
+      buffer.writeln();
+    }
+    if (imagePieces.isNotEmpty) {
+      buffer.writeln('【PPT 图片】');
+      for (final piece in imagePieces) {
+        final time = piece.timeLabel != null ? '[${piece.timeLabel}] ' : '';
+        buffer.writeln('$time${piece.content}');
+      }
+    }
+    Navigator.of(context).pop(buffer.toString().trim());
   }
 
   String _normalizeJsResult(Object raw) {
@@ -2273,4 +2409,13 @@ class _LessonCapturePageState extends State<LessonCapturePage> {
     }
     return text;
   }
+}
+
+class _CapturePiece {
+  _CapturePiece({required this.isImage, required this.content, String? time})
+      : timeLabel = (time != null && time.trim().isNotEmpty) ? time.trim() : null;
+
+  final bool isImage;
+  final String content;
+  final String? timeLabel;
 }
