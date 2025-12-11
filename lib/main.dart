@@ -2,8 +2,10 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const RemindApp());
 }
 
@@ -44,6 +46,7 @@ class _HomeShellState extends State<HomeShell> {
   late Future<WeeklyScheduleOverview> _overviewFuture;
   late ScheduleRepository _repository;
   final GlobalKey<AgendaTabState> _agendaKey = GlobalKey<AgendaTabState>();
+  DateTime? _termStartDate;
 
   @override
   void initState() {
@@ -51,6 +54,7 @@ class _HomeShellState extends State<HomeShell> {
     _repository = MockScheduleRepository();
     _scheduleService = ScheduleService(repository: _repository);
     _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
+    _loadTermStartDate();
   }
 
   void _reload() {
@@ -80,6 +84,67 @@ class _HomeShellState extends State<HomeShell> {
         builder: (ctx) => WebImportPage(onImported: _applyImportedLessons),
       ),
     );
+  }
+
+  Future<void> _loadTermStartDate() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final millis = prefs.getInt('term_start_date');
+      if (!mounted) return;
+      setState(() {
+        _termStartDate = millis != null ? DateTime.fromMillisecondsSinceEpoch(millis) : null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('开学日期读取失败：$e')),
+      );
+    }
+  }
+
+  Future<void> _saveTermStartDate(DateTime date) async {
+    final normalized = DateTime(date.year, date.month, date.day);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('term_start_date', normalized.millisecondsSinceEpoch);
+      if (!mounted) return;
+      setState(() {
+        _termStartDate = normalized;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已设置开学日期为 ${normalized.month}/${normalized.day}'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('保存开学日期失败：$e')),
+      );
+    }
+  }
+
+  Future<void> _pickTermStartDate(BuildContext context) async {
+    final initial = _termStartDate ?? DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(initial.year - 1),
+      lastDate: DateTime(initial.year + 1),
+    );
+    if (picked != null) {
+      await _saveTermStartDate(picked);
+    }
+  }
+
+  int? _currentWeekNumber() {
+    if (_termStartDate == null) return null;
+    final normalizedStart = DateTime(_termStartDate!.year, _termStartDate!.month, _termStartDate!.day);
+    final now = DateTime.now();
+    final diff = now.difference(normalizedStart);
+    final week = diff.inDays ~/ 7 + 1;
+    return week <= 0 ? 1 : week;
   }
 
   @override
@@ -138,15 +203,43 @@ class _HomeShellState extends State<HomeShell> {
         }
 
         final overview = snapshot.data!;
+        final weekNumber = _currentWeekNumber();
         final pages = [
-          TimetableTab(weekDays: overview.weekDays),
+          TimetableTab(
+            weekDays: overview.weekDays,
+            currentWeekNumber: weekNumber,
+            termStartDate: _termStartDate,
+          ),
           AgendaTab(key: _agendaKey, items: overview.scheduleItems),
-          UserTab(onOpenImport: _openWebImport),
+          UserTab(
+            onOpenImport: _openWebImport,
+            onPickTermStart: () => _pickTermStartDate(context),
+            termStartDate: _termStartDate,
+          ),
         ];
+
+        String? startLabel;
+        if (_termStartDate != null) {
+          startLabel =
+              '${_termStartDate!.year}-${_termStartDate!.month.toString().padLeft(2, '0')}-${_termStartDate!.day.toString().padLeft(2, '0')}';
+        }
+        final weekTitle = weekNumber != null ? '第$weekNumber周' : '尚未设置开学日期';
 
         return Scaffold(
           appBar: AppBar(
-            title: Text(titles[_currentIndex]),
+            title: _currentIndex == 0
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('课程表 · $weekTitle'),
+                      if (startLabel != null)
+                        Text(
+                          '开学日：$startLabel',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                    ],
+                  )
+                : Text(titles[_currentIndex]),
             actions: [
               if (_currentIndex != 2)
                 IconButton(onPressed: _reload, icon: const Icon(Icons.refresh), tooltip: '刷新数据'),
@@ -167,7 +260,12 @@ class _HomeShellState extends State<HomeShell> {
               : null,
           bottomNavigationBar: NavigationBar(
             selectedIndex: _currentIndex,
-            onDestinationSelected: (index) => setState(() => _currentIndex = index),
+            onDestinationSelected: (index) {
+              setState(() => _currentIndex = index);
+              if (index == 0) {
+                _loadTermStartDate();
+              }
+            },
             destinations: const [
               NavigationDestination(icon: Icon(Icons.calendar_view_week_outlined), label: '课程表'),
               NavigationDestination(icon: Icon(Icons.event_note_outlined), label: '日程'),
@@ -181,9 +279,16 @@ class _HomeShellState extends State<HomeShell> {
 }
 
 class TimetableTab extends StatelessWidget {
-  const TimetableTab({super.key, required this.weekDays});
+  const TimetableTab({
+    super.key,
+    required this.weekDays,
+    this.currentWeekNumber,
+    this.termStartDate,
+  });
 
   final List<WeekDayLessons> weekDays;
+  final int? currentWeekNumber;
+  final DateTime? termStartDate;
 
   @override
   Widget build(BuildContext context) {
@@ -201,7 +306,6 @@ class TimetableTab extends StatelessWidget {
         final dayColumnWidth = fittedWidth < minDayColumnWidth ? minDayColumnWidth : fittedWidth;
         final tableWidth = timeColumnWidth + dayColumnWidth * dayCount;
         final needsHorizontal = tableWidth + pagePadding * 2 > screenWidth;
-
         final table = Padding(
           padding: const EdgeInsets.symmetric(horizontal: pagePadding),
           child: SizedBox(
@@ -211,13 +315,18 @@ class TimetableTab extends StatelessWidget {
               timeColumnWidth: timeColumnWidth,
               dayColumnWidth: dayColumnWidth,
               slotHeight: slotHeight,
+              currentWeekNumber: currentWeekNumber,
             ),
           ),
         );
 
+        final Widget body = needsHorizontal
+            ? SingleChildScrollView(scrollDirection: Axis.horizontal, child: table)
+            : Center(child: table);
+
         return SingleChildScrollView(
           padding: const EdgeInsets.only(bottom: 24),
-          child: needsHorizontal ? SingleChildScrollView(scrollDirection: Axis.horizontal, child: table) : Center(child: table),
+          child: body,
         );
       },
     );
@@ -230,12 +339,14 @@ class _TimetableContent extends StatelessWidget {
     required this.timeColumnWidth,
     required this.dayColumnWidth,
     required this.slotHeight,
+    this.currentWeekNumber,
   });
 
   final List<WeekDayLessons> weekDays;
   final double timeColumnWidth;
   final double dayColumnWidth;
   final double slotHeight;
+  final int? currentWeekNumber;
   @override
   Widget build(BuildContext context) {
     final totalHeight = slotHeight * kTimeSlots.length;
@@ -314,66 +425,95 @@ class _TimetableContent extends StatelessWidget {
                       final baseColor = _courseColor(lesson.courseName);
                       final top = (span.startIndex - 1) * slotHeight + 4;
                       final height = span.slotCount * slotHeight - 8;
-                          final textTheme = Theme.of(context).textTheme;
-                          return Positioned(
-                            left: dayIndex * dayColumnWidth + 6,
-                            top: top,
-                            width: dayColumnWidth - 12,
-                            height: height,
-                            child: Container(
-                              padding: const EdgeInsets.all(8),
-                              decoration: BoxDecoration(
-                                color: baseColor.withOpacity(0.22),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(color: baseColor.withOpacity(0.55), width: 1.2),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: baseColor.withOpacity(0.18),
-                                    blurRadius: 16,
-                                    offset: const Offset(0, 8),
-                                  ),
-                                ],
+                      final textTheme = Theme.of(context).textTheme;
+                      final remark = _formatLessonRemark(lesson.topic);
+                      final bool isActive = currentWeekNumber == null
+                          ? true
+                          : (lesson.weekPattern?.isActive(currentWeekNumber!) ?? true);
+                      final fillColor = baseColor.withOpacity(isActive ? 0.22 : 0.08);
+                      final borderColor = baseColor.withOpacity(isActive ? 0.55 : 0.25);
+                      final titleColor = isActive ? Colors.black87 : Colors.black45;
+                      final infoColor = isActive ? Colors.black87 : Colors.black45;
+                      final teacherColor = isActive ? Colors.black54 : Colors.black38;
+                      final weekDesc = lesson.weekPattern?.description();
+                      return Positioned(
+                        left: dayIndex * dayColumnWidth + 6,
+                        top: top,
+                        width: dayColumnWidth - 12,
+                        height: height,
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: fillColor,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: borderColor, width: 1.2),
+                            boxShadow: [
+                              BoxShadow(
+                                color: baseColor.withOpacity(isActive ? 0.18 : 0.08),
+                                blurRadius: 16,
+                                offset: const Offset(0, 8),
                               ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    lesson.courseName,
-                                    style: textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold, fontSize: 12),
-                                    maxLines: 3,
-                                    softWrap: true,
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
-                                    style: textTheme.bodySmall?.copyWith(fontSize: 11),
-                                    maxLines: 2,
-                                    softWrap: true,
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    lesson.location,
-                                    style: textTheme.bodySmall?.copyWith(fontSize: 11),
-                                    maxLines: 2,
-                                    softWrap: true,
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    lesson.teacher,
-                                    style: textTheme.bodySmall?.copyWith(color: Colors.black54, fontSize: 11),
-                                    softWrap: true,
-                                  ),
-                                  if (lesson.topic.isNotEmpty) ...[
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      '要点：${lesson.topic}',
-                                      style: textTheme.bodySmall?.copyWith(fontSize: 11),
-                                      maxLines: 3,
-                                      softWrap: true,
-                                    ),
-                                  ],
-                                ],
+                            ],
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                lesson.courseName,
+                                style: textTheme.titleSmall?.copyWith(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 12,
+                                  color: titleColor,
+                                ),
+                                maxLines: 3,
+                                softWrap: true,
                               ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
+                                style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
+                                maxLines: 2,
+                                softWrap: true,
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                lesson.location,
+                                style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
+                                maxLines: 2,
+                                softWrap: true,
+                              ),
+                              const SizedBox(height: 2),
+                              if (lesson.teacher.trim().isNotEmpty)
+                                Text(
+                                  '教师：${lesson.teacher}',
+                                  style: textTheme.bodySmall?.copyWith(color: teacherColor, fontSize: 11),
+                                  maxLines: 4,
+                                  softWrap: true,
+                                ),
+                              if (remark != null) ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  remark,
+                                  style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
+                                  maxLines: 3,
+                                  softWrap: true,
+                                ),
+                              ],
+                              if (!isActive) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  (weekDesc != null && weekDesc.isNotEmpty)
+                                      ? '本周不上课 · $weekDesc'
+                                      : '本周不上课',
+                                  style: textTheme.bodySmall?.copyWith(
+                                    fontSize: 11,
+                                    color: Colors.black38,
+                                    fontStyle: FontStyle.italic,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
                         ),
                       );
                     }),
@@ -534,14 +674,24 @@ class AgendaTabState extends State<AgendaTab> {
 }
 
 class UserTab extends StatelessWidget {
-  const UserTab({super.key, required this.onOpenImport});
+  const UserTab({
+    super.key,
+    required this.onOpenImport,
+    required this.onPickTermStart,
+    this.termStartDate,
+  });
 
   final VoidCallback onOpenImport;
+  final VoidCallback onPickTermStart;
+  final DateTime? termStartDate;
 
   @override
   Widget build(BuildContext context) {
     final color = Theme.of(context).colorScheme;
     final secondaryText = Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.white70);
+    final startLabel = termStartDate != null
+        ? '当前开学日：${termStartDate!.year}-${termStartDate!.month.toString().padLeft(2, '0')}-${termStartDate!.day.toString().padLeft(2, '0')}'
+        : '尚未设置本学期开学日期';
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
       children: [
@@ -574,6 +724,11 @@ class UserTab extends StatelessWidget {
                 '在内置 WebView 登录教务系统，自动抓取并更新课堂信息，生成智能复习计划。',
                 style: secondaryText,
               ),
+              const SizedBox(height: 12),
+              Text(
+                startLabel,
+                style: secondaryText,
+              ),
               const SizedBox(height: 16),
               ElevatedButton.icon(
                 style: ElevatedButton.styleFrom(
@@ -585,6 +740,17 @@ class UserTab extends StatelessWidget {
                 onPressed: onOpenImport,
                 icon: const Icon(Icons.cloud_download_outlined),
                 label: const Text('打开教务网站并导入'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: Colors.white.withOpacity(0.7)),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                ),
+                onPressed: onPickTermStart,
+                icon: const Icon(Icons.event_available_outlined),
+                label: const Text('设置学期第一周第一天'),
               ),
               const SizedBox(height: 6),
               Text('支持 i.sjtu.edu.cn', style: secondaryText),
@@ -724,6 +890,7 @@ class Lesson {
     required this.endTime,
     required this.topic,
     required this.location,
+    this.weekPattern,
   });
 
   final String courseName;
@@ -732,6 +899,7 @@ class Lesson {
   final DateTime endTime;
   final String topic;
   final String location;
+  final WeekPattern? weekPattern;
 }
 
 class ReviewTask {
@@ -755,6 +923,39 @@ class ReviewTask {
     return '课后${offsetFromLesson.inDays}天';
   }
 }
+
+class WeekPattern {
+  const WeekPattern({this.startWeek, this.endWeek, this.parity = WeekParity.any});
+
+  final int? startWeek;
+  final int? endWeek;
+  final WeekParity parity;
+
+  bool isActive(int currentWeek) {
+    if (currentWeek <= 0) return false;
+    if (startWeek != null && currentWeek < startWeek!) return false;
+    if (endWeek != null && currentWeek > endWeek!) return false;
+    if (parity == WeekParity.odd && currentWeek % 2 == 0) return false;
+    if (parity == WeekParity.even && currentWeek % 2 != 0) return false;
+    return true;
+  }
+
+  String description() {
+    final range = startWeek != null
+        ? endWeek != null && endWeek != startWeek
+            ? '$startWeek-$endWeek周'
+            : '$startWeek周'
+        : '';
+    final parityLabel = parity == WeekParity.odd
+        ? '仅单周'
+        : parity == WeekParity.even
+            ? '仅双周'
+            : '';
+    return [range, parityLabel].where((e) => e.isNotEmpty).join(' · ');
+  }
+}
+
+enum WeekParity { any, odd, even }
 
 class ScheduleItem {
   ScheduleItem({
@@ -867,6 +1068,7 @@ class MockScheduleRepository implements ScheduleRepository {
           endTime: dayStart.add(const Duration(hours: 11, minutes: 30)),
           topic: '简历与面试技巧',
           location: '学生中心201',
+          weekPattern: const WeekPattern(),
         ),
       ];
     }
@@ -880,6 +1082,7 @@ class MockScheduleRepository implements ScheduleRepository {
           endTime: dayStart.add(const Duration(hours: 16, minutes: 30)),
           topic: '压力管理与自我调节',
           location: '教学楼C区102',
+          weekPattern: const WeekPattern(),
         ),
       ];
     }
@@ -896,6 +1099,7 @@ class MockScheduleRepository implements ScheduleRepository {
         endTime: dayStart.add(const Duration(hours: 9, minutes: 40)),
         topic: '第5章 定积分与应用',
         location: '教学楼A区205',
+        weekPattern: const WeekPattern(),
       ),
       Lesson(
         courseName: '大学英语',
@@ -904,6 +1108,7 @@ class MockScheduleRepository implements ScheduleRepository {
         endTime: dayStart.add(const Duration(hours: 11, minutes: 40)),
         topic: 'Unit 6 Reading Skills',
         location: '教学楼B区308',
+        weekPattern: const WeekPattern(),
       ),
       Lesson(
         courseName: '数据结构',
@@ -912,6 +1117,7 @@ class MockScheduleRepository implements ScheduleRepository {
         endTime: dayStart.add(const Duration(hours: 15, minutes: 40)),
         topic: '第3章 栈与队列',
         location: '信息楼C区101',
+        weekPattern: const WeekPattern(),
       ),
     ];
   }
@@ -1074,6 +1280,15 @@ String _formatTime(DateTime time) {
   return '$hour:$minute';
 }
 
+String? _formatLessonRemark(String remark) {
+  final clean = remark.trim();
+  if (clean.isEmpty) return null;
+  const keywords = ['主修', '必修', '选修', '通识', '课程标记'];
+  final hasKeyword = keywords.any(clean.contains);
+  final label = hasKeyword ? '课程标记' : '要点';
+  return '$label：$clean';
+}
+
 class WebImportPage extends StatefulWidget {
   const WebImportPage({super.key, required this.onImported});
 
@@ -1196,10 +1411,13 @@ class _WebImportPageState extends State<WebImportPage> {
           const title = (cell.querySelector('.title')?.innerText || '').replace(/\s+/g, ' ').trim();
           const info = {};
           cell.querySelectorAll('p').forEach(p => {
-            const label = p.querySelector('[data-toggle="tooltip"]')?.getAttribute('title') || '';
+            const label = (p.querySelector('[data-toggle="tooltip"]')?.getAttribute('title') || '').trim();
             const value = p.innerText.replace(/\s+/g, ' ').trim();
             if (label && value) {
-              info[label] = value;
+              if (!info[label]) {
+                info[label] = [];
+              }
+              info[label].push(value);
             }
           });
           const td = cell.closest('td');
@@ -1276,7 +1494,7 @@ class _WebImportPageState extends State<WebImportPage> {
   Lesson? _mapCourseToLesson(Map<String, dynamic> course, DateTime monday) {
     final info = Map<String, dynamic>.from(course['info'] as Map? ?? {});
     final rowSpan = int.tryParse('${course['rowSpan'] ?? ''}');
-    final slotText = info['节/周'] as String? ?? info['节次'] as String?;
+    final slotText = _firstText(info['节/周']) ?? _firstText(info['节次']);
     final slotRange = _parseSlotRange(slotText, rowSpan: rowSpan);
     final dayOffset = _parseDayOffset(course['columnIndex']);
     if (slotRange == null || dayOffset == null) return null;
@@ -1288,13 +1506,21 @@ class _WebImportPageState extends State<WebImportPage> {
     final startTime = DateTime(date.year, date.month, date.day, startSlot.start.hour, startSlot.start.minute);
     final endTime = DateTime(date.year, date.month, date.day, endSlot.end.hour, endSlot.end.minute);
 
+    final teachers = _normalizeList(info['教师']);
+    final teacherLabel = teachers.isEmpty ? '' : teachers.join(' / ');
+
+    final topics = _normalizeList(info['课程标记'] ?? info['选课备注']);
+    final topicText = topics.isEmpty ? (_firstText(info['节/周']) ?? '') : topics.join(' / ');
+    final weekPattern = _parseWeekPattern(_firstText(info['节/周']));
+
     return Lesson(
-      courseName: _cleanText(course['title'] ?? info['教学班名称'] ?? '课程'),
-      teacher: _cleanText(info['教师']),
+      courseName: _firstText(course['title']) ?? _firstText(info['教学班名称']) ?? '课程',
+      teacher: teacherLabel,
       startTime: startTime,
       endTime: endTime,
-      topic: _cleanText(info['课程标记'] ?? info['选课备注'] ?? info['节/周']),
-      location: _cleanText(info['上课地点']),
+      topic: topicText,
+      location: _firstText(info['上课地点']) ?? '',
+      weekPattern: weekPattern,
     );
   }
 
@@ -1307,7 +1533,7 @@ class _WebImportPageState extends State<WebImportPage> {
     if (columnIndex == null) return null;
     final index = columnIndex is num ? columnIndex.toInt() : int.tryParse(columnIndex.toString());
     if (index == null) return null;
-    final offset = index - 1;
+    final offset = index - 2;
     if (offset < 0 || offset > 6) return null;
     return offset;
   }
@@ -1330,6 +1556,26 @@ class _WebImportPageState extends State<WebImportPage> {
     return null;
   }
 
+  WeekPattern? _parseWeekPattern(String? text) {
+    if (text == null) return null;
+    final normalized = text.replaceAll('（', '(').replaceAll('）', ')');
+    final match = RegExp(r'(\d+)(?:\s*-\s*(\d+))?周').firstMatch(normalized);
+    int? start;
+    int? end;
+    if (match != null) {
+      start = int.tryParse(match.group(1)!);
+      end = match.group(2) != null ? int.tryParse(match.group(2)!) : start;
+    }
+    WeekParity parity = WeekParity.any;
+    if (normalized.contains('单周') || normalized.contains('(单') || normalized.contains('单)')) {
+      parity = WeekParity.odd;
+    } else if (normalized.contains('双周') || normalized.contains('(双') || normalized.contains('双)')) {
+      parity = WeekParity.even;
+    }
+    if (start == null && parity == WeekParity.any) return null;
+    return WeekPattern(startWeek: start, endWeek: end, parity: parity);
+  }
+
   TimeSlot? _slotByIndex(int index) {
     for (final slot in kTimeSlots) {
       if (slot.index == index) return slot;
@@ -1337,9 +1583,28 @@ class _WebImportPageState extends State<WebImportPage> {
     return null;
   }
 
+  List<String> _normalizeList(dynamic value) {
+    if (value == null) return [];
+    if (value is List) {
+      return value.map((e) => _cleanText(e)).where((e) => e.isNotEmpty).toList();
+    }
+    final text = _cleanText(value);
+    if (text.isEmpty) return [];
+    // Try splitting by / or 、
+    final parts = text.split(RegExp(r'[、/，,]')).map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    return parts.isEmpty ? [text] : parts;
+  }
+
   String _cleanText(dynamic value) {
     if (value == null) return '';
     return value.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  String? _firstText(dynamic value) {
+    final list = _normalizeList(value);
+    if (list.isNotEmpty) return list.first;
+    final text = _cleanText(value);
+    return text.isEmpty ? null : text;
   }
 }
 
