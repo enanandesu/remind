@@ -9,32 +9,103 @@ void main() {
   runApp(const RemindApp());
 }
 
-class RemindApp extends StatelessWidget {
+class AppThemeSetting {
+  const AppThemeSetting({
+    required this.seedColor,
+  });
+
+  final Color seedColor;
+
+  AppThemeSetting copyWith({Color? seedColor}) {
+    return AppThemeSetting(
+      seedColor: seedColor ?? this.seedColor,
+    );
+  }
+
+  ThemeData _buildTheme() {
+    final colorScheme = ColorScheme.fromSeed(seedColor: seedColor, brightness: Brightness.light);
+    final base = ThemeData(
+      colorScheme: colorScheme,
+      useMaterial3: true,
+      brightness: Brightness.light,
+    );
+    return base.copyWith(
+      scaffoldBackgroundColor: Colors.grey.shade50,
+      textTheme: base.textTheme.apply(
+        bodyColor: Colors.grey.shade900,
+        displayColor: Colors.grey.shade900,
+      ),
+    );
+  }
+
+  ThemeData get lightTheme => _buildTheme();
+}
+
+const AppThemeSetting _defaultTheme = AppThemeSetting(
+  seedColor: Colors.indigo,
+);
+
+
+class RemindApp extends StatefulWidget {
   const RemindApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final baseTheme = ThemeData(
-      colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-      useMaterial3: true,
-    );
+  State<RemindApp> createState() => _RemindAppState();
+}
 
+class _RemindAppState extends State<RemindApp> {
+  AppThemeSetting _themeSetting = _defaultTheme;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTheme();
+  }
+
+  Future<void> _loadTheme() async {
+    final prefs = await SharedPreferences.getInstance();
+    final colorValue = prefs.getInt('theme_seed');
+    AppThemeSetting setting = _defaultTheme;
+    if (colorValue != null) {
+      setting = setting.copyWith(seedColor: Color(colorValue));
+    }
+    if (!mounted) return;
+    setState(() {
+      _themeSetting = setting;
+    });
+  }
+
+  Future<void> _updateTheme(AppThemeSetting setting) async {
+    setState(() {
+      _themeSetting = setting;
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('theme_seed', setting.seedColor.value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return MaterialApp(
       title: '复习提醒助手',
-      theme: baseTheme.copyWith(
-        scaffoldBackgroundColor: Colors.grey.shade50,
-        textTheme: baseTheme.textTheme.apply(
-          bodyColor: Colors.grey.shade900,
-          displayColor: Colors.grey.shade900,
-        ),
+      theme: _themeSetting.lightTheme,
+      themeMode: ThemeMode.light,
+      home: HomeShell(
+        themeSetting: _themeSetting,
+        onThemeChanged: _updateTheme,
       ),
-      home: const HomeShell(),
     );
   }
 }
 
 class HomeShell extends StatefulWidget {
-  const HomeShell({super.key});
+  const HomeShell({
+    super.key,
+    required this.themeSetting,
+    required this.onThemeChanged,
+  });
+
+  final AppThemeSetting themeSetting;
+  final ValueChanged<AppThemeSetting> onThemeChanged;
 
   @override
   State<HomeShell> createState() => _HomeShellState();
@@ -47,6 +118,8 @@ class _HomeShellState extends State<HomeShell> {
   late ScheduleRepository _repository;
   final GlobalKey<AgendaTabState> _agendaKey = GlobalKey<AgendaTabState>();
   DateTime? _termStartDate;
+  static const String _lessonSummaryPrefKey = 'lesson_summaries';
+  final Map<String, String> _lessonSummaries = {};
 
   @override
   void initState() {
@@ -55,6 +128,7 @@ class _HomeShellState extends State<HomeShell> {
     _scheduleService = ScheduleService(repository: _repository);
     _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
     _loadTermStartDate();
+    _loadLessonSummaries();
   }
 
   void _reload() {
@@ -86,6 +160,31 @@ class _HomeShellState extends State<HomeShell> {
     );
   }
 
+  Future<void> _loadLessonSummaries() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_lessonSummaryPrefKey);
+      if (raw == null) return;
+      final decoded = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      if (!mounted) return;
+      setState(() {
+        _lessonSummaries
+          ..clear()
+          ..addEntries(decoded.entries.map((e) => MapEntry(e.key, e.value.toString())));
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('课程要点读取失败：$e')),
+      );
+    }
+  }
+
+  Future<void> _persistLessonSummaries() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_lessonSummaryPrefKey, jsonEncode(_lessonSummaries));
+  }
+
   Future<void> _loadTermStartDate() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -100,6 +199,39 @@ class _HomeShellState extends State<HomeShell> {
         SnackBar(content: Text('开学日期读取失败：$e')),
       );
     }
+  }
+
+  Future<void> _openLessonCapture(Lesson lesson) async {
+    final key = lessonStorageKey(lesson);
+    final initial = _lessonSummaries[key];
+    final result = await Navigator.of(context).push<String?>(
+      MaterialPageRoute(
+        builder: (ctx) => LessonCapturePage(
+          lesson: lesson,
+          initialSummary: initial,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    final trimmed = result?.trim();
+    if (trimmed == null) return;
+    if (trimmed.isEmpty) {
+      setState(() {
+        _lessonSummaries.remove(key);
+      });
+      await _persistLessonSummaries();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已清除课程要点')),
+      );
+      return;
+    }
+    setState(() {
+      _lessonSummaries[key] = trimmed;
+    });
+    await _persistLessonSummaries();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已更新「${lesson.courseName}」的课堂要点')),
+    );
   }
 
   Future<void> _saveTermStartDate(DateTime date) async {
@@ -209,12 +341,16 @@ class _HomeShellState extends State<HomeShell> {
             weekDays: overview.weekDays,
             currentWeekNumber: weekNumber,
             termStartDate: _termStartDate,
+            onCaptureLesson: _openLessonCapture,
+            lessonSummaries: _lessonSummaries,
           ),
           AgendaTab(key: _agendaKey, items: overview.scheduleItems),
           UserTab(
             onOpenImport: _openWebImport,
             onPickTermStart: () => _pickTermStartDate(context),
             termStartDate: _termStartDate,
+            themeSetting: widget.themeSetting,
+            onThemeChanged: widget.onThemeChanged,
           ),
         ];
 
@@ -284,11 +420,15 @@ class TimetableTab extends StatelessWidget {
     required this.weekDays,
     this.currentWeekNumber,
     this.termStartDate,
+    required this.onCaptureLesson,
+    required this.lessonSummaries,
   });
 
   final List<WeekDayLessons> weekDays;
   final int? currentWeekNumber;
   final DateTime? termStartDate;
+  final ValueChanged<Lesson> onCaptureLesson;
+  final Map<String, String> lessonSummaries;
 
   @override
   Widget build(BuildContext context) {
@@ -316,6 +456,8 @@ class TimetableTab extends StatelessWidget {
               dayColumnWidth: dayColumnWidth,
               slotHeight: slotHeight,
               currentWeekNumber: currentWeekNumber,
+              onCaptureLesson: onCaptureLesson,
+              lessonSummaries: lessonSummaries,
             ),
           ),
         );
@@ -340,6 +482,8 @@ class _TimetableContent extends StatelessWidget {
     required this.dayColumnWidth,
     required this.slotHeight,
     this.currentWeekNumber,
+    required this.onCaptureLesson,
+    required this.lessonSummaries,
   });
 
   final List<WeekDayLessons> weekDays;
@@ -347,6 +491,8 @@ class _TimetableContent extends StatelessWidget {
   final double dayColumnWidth;
   final double slotHeight;
   final int? currentWeekNumber;
+  final ValueChanged<Lesson> onCaptureLesson;
+  final Map<String, String> lessonSummaries;
   @override
   Widget build(BuildContext context) {
     final totalHeight = slotHeight * kTimeSlots.length;
@@ -426,7 +572,11 @@ class _TimetableContent extends StatelessWidget {
                       final top = (span.startIndex - 1) * slotHeight + 4;
                       final height = span.slotCount * slotHeight - 8;
                       final textTheme = Theme.of(context).textTheme;
-                      final remark = _formatLessonRemark(lesson.topic);
+                      final storedSummary = lessonSummaries[lessonStorageKey(lesson)];
+                      final summaryText = storedSummary?.trim();
+                      final remark = (summaryText != null && summaryText.isNotEmpty)
+                          ? summaryText
+                          : _formatLessonRemark(lesson.topic);
                       final bool isActive = currentWeekNumber == null
                           ? true
                           : (lesson.weekPattern?.isActive(currentWeekNumber!) ?? true);
@@ -441,78 +591,91 @@ class _TimetableContent extends StatelessWidget {
                         top: top,
                         width: dayColumnWidth - 12,
                         height: height,
-                        child: Container(
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: fillColor,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
                             borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: borderColor, width: 1.2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: baseColor.withOpacity(isActive ? 0.18 : 0.08),
-                                blurRadius: 16,
-                                offset: const Offset(0, 8),
-                              ),
-                            ],
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                lesson.courseName,
-                                style: textTheme.titleSmall?.copyWith(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 12,
-                                  color: titleColor,
-                                ),
-                                maxLines: 3,
-                                softWrap: true,
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
-                                style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
-                                maxLines: 2,
-                                softWrap: true,
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                lesson.location,
-                                style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
-                                maxLines: 2,
-                                softWrap: true,
-                              ),
-                              const SizedBox(height: 2),
-                              if (lesson.teacher.trim().isNotEmpty)
-                                Text(
-                                  '教师：${lesson.teacher}',
-                                  style: textTheme.bodySmall?.copyWith(color: teacherColor, fontSize: 11),
-                                  maxLines: 4,
-                                  softWrap: true,
-                                ),
-                              if (remark != null) ...[
-                                const SizedBox(height: 2),
-                                Text(
-                                  remark,
-                                  style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
-                                  maxLines: 3,
-                                  softWrap: true,
-                                ),
-                              ],
-                              if (!isActive) ...[
-                                const SizedBox(height: 4),
-                                Text(
-                                  (weekDesc != null && weekDesc.isNotEmpty)
-                                      ? '本周不上课 · $weekDesc'
-                                      : '本周不上课',
-                                  style: textTheme.bodySmall?.copyWith(
-                                    fontSize: 11,
-                                    color: Colors.black38,
-                                    fontStyle: FontStyle.italic,
+                            onTap: () => _showLessonDetail(
+                              context,
+                              lesson,
+                              isActive,
+                              summaryText,
+                              onCaptureLesson,
+                            ),
+                            child: Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: fillColor,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: borderColor, width: 1.2),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: baseColor.withOpacity(isActive ? 0.18 : 0.08),
+                                    blurRadius: 16,
+                                    offset: const Offset(0, 8),
                                   ),
-                                ),
-                              ],
-                            ],
+                                ],
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    lesson.courseName,
+                                    style: textTheme.titleSmall?.copyWith(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 12,
+                                      color: titleColor,
+                                    ),
+                                    maxLines: 3,
+                                    softWrap: true,
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}',
+                                    style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
+                                    maxLines: 2,
+                                    softWrap: true,
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    lesson.location,
+                                    style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
+                                    maxLines: 2,
+                                    softWrap: true,
+                                  ),
+                                  const SizedBox(height: 2),
+                                  if (lesson.teacher.trim().isNotEmpty)
+                                    Text(
+                                      '教师：${lesson.teacher}',
+                                      style: textTheme.bodySmall?.copyWith(color: teacherColor, fontSize: 11),
+                                      maxLines: 4,
+                                      softWrap: true,
+                                    ),
+                                  if (remark != null) ...[
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      remark,
+                                      style: textTheme.bodySmall?.copyWith(fontSize: 11, color: infoColor),
+                                      maxLines: 4,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ],
+                                  if (!isActive) ...[
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      (weekDesc != null && weekDesc.isNotEmpty)
+                                          ? '本周不上课 · $weekDesc'
+                                          : '本周不上课',
+                                      style: textTheme.bodySmall?.copyWith(
+                                        fontSize: 11,
+                                        color: Colors.black38,
+                                        fontStyle: FontStyle.italic,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
                           ),
                         ),
                       );
@@ -523,6 +686,122 @@ class _TimetableContent extends StatelessWidget {
           ],
         ),
       ],
+    );
+  }
+
+  void _showLessonDetail(
+    BuildContext context,
+    Lesson lesson,
+    bool isActive,
+    String? capturedSummary,
+    ValueChanged<Lesson> onCaptureLesson,
+  ) {
+    final hasCaptured = capturedSummary != null && capturedSummary.trim().isNotEmpty;
+    final fallbackRemark = _formatLessonRemark(lesson.topic);
+    final displayText = hasCaptured ? capturedSummary!.trim() : fallbackRemark;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            bottom: 20 + MediaQuery.of(ctx).viewInsets.bottom,
+            top: 20,
+          ),
+          child: Wrap(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          lesson.courseName,
+                          style: Theme.of(ctx).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${_formatTime(lesson.startTime)} - ${_formatTime(lesson.endTime)}  | ${lesson.location}',
+                          style: Theme.of(ctx).textTheme.bodySmall,
+                        ),
+                        if (!isActive)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Text(
+                              '提示：课程安排在其他周，本周无需上课',
+                              style: Theme.of(ctx).textTheme.bodySmall?.copyWith(color: Colors.orange),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              if (lesson.teacher.trim().isNotEmpty)
+                Row(
+                  children: [
+                    const Icon(Icons.person_outline, size: 18),
+                    const SizedBox(width: 6),
+                    Text('教师：${lesson.teacher}'),
+                  ],
+                ),
+              const SizedBox(height: 12),
+              if (displayText != null)
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      hasCaptured ? '课堂要点（已抓取）' : '课堂要点',
+                      style: Theme.of(ctx).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      displayText,
+                      style: Theme.of(ctx).textTheme.bodyMedium,
+                    ),
+                  ],
+                )
+              else
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('暂无课堂要点', style: Theme.of(ctx).textTheme.titleMedium),
+                    const SizedBox(height: 8),
+                    Text('尚未抓取该课程的详细内容，可立即前往教学网站抓取。'),
+                  ],
+                ),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  onCaptureLesson(lesson);
+                },
+                icon: Icon(hasCaptured ? Icons.add_circle_outline : Icons.play_arrow_rounded),
+                label: Text(hasCaptured ? '补充抓取 / 增加细节' : '去抓取'),
+              ),
+              if (hasCaptured)
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    onCaptureLesson(lesson);
+                  },
+                  child: const Text('重新抓取 / 覆盖原文'),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -678,11 +957,15 @@ class UserTab extends StatelessWidget {
     super.key,
     required this.onOpenImport,
     required this.onPickTermStart,
+    required this.themeSetting,
+    required this.onThemeChanged,
     this.termStartDate,
   });
 
   final VoidCallback onOpenImport;
   final VoidCallback onPickTermStart;
+  final AppThemeSetting themeSetting;
+  final ValueChanged<AppThemeSetting> onThemeChanged;
   final DateTime? termStartDate;
 
   @override
@@ -767,13 +1050,65 @@ class UserTab extends StatelessWidget {
                 title: '提醒设置',
                 subtitle: '设置复习提醒与免打扰时段',
               ),
-              const Divider(height: 1),
-              const _UserSettingTile(
-                icon: Icons.palette_outlined,
-                title: '主题风格',
-                subtitle: '选择浅色/深色模式和强调色',
-              ),
             ],
+          ),
+        ),
+        const SizedBox(height: 24),
+        Card(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('主题风格', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Text('强调色', style: Theme.of(context).textTheme.bodySmall),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 16,
+                  runSpacing: 12,
+                  children: _themeColorOptions.map((option) {
+                    final selected = themeSetting.seedColor.value == option.color.value;
+                    return GestureDetector(
+                      onTap: () => onThemeChanged(themeSetting.copyWith(seedColor: option.color)),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          AnimatedContainer(
+                            duration: const Duration(milliseconds: 200),
+                            width: 40,
+                            height: 40,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: option.color,
+                              border: Border.all(
+                                color: selected ? option.color.withOpacity(0.8) : Colors.black12,
+                                width: selected ? 4 : 1,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: option.color.withOpacity(0.35),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 6),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            option.label,
+                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                  color: selected ? Theme.of(context).colorScheme.primary : null,
+                                ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ],
+            ),
           ),
         ),
       ],
@@ -808,6 +1143,19 @@ class _UserSettingTile extends StatelessWidget {
     );
   }
 }
+
+class _ThemeColorOption {
+  const _ThemeColorOption(this.label, this.color);
+  final String label;
+  final Color color;
+}
+
+const List<_ThemeColorOption> _themeColorOptions = [
+  _ThemeColorOption('星辰蓝', Colors.indigo),
+  _ThemeColorOption('薄荷绿', Color(0xFF2EC4B6)),
+  _ThemeColorOption('晨曦橙', Color(0xFFFF9F1C)),
+  _ThemeColorOption('暮霞粉', Color(0xFFE86AA7)),
+];
 
 class _ScheduleItemCard extends StatelessWidget {
   const _ScheduleItemCard({required this.item, this.onEdit, this.onDelete});
@@ -900,6 +1248,14 @@ class Lesson {
   final String topic;
   final String location;
   final WeekPattern? weekPattern;
+}
+
+String lessonStorageKey(Lesson lesson) {
+  final start = lesson.startTime.toIso8601String();
+  final name = lesson.courseName.trim();
+  final location = lesson.location.trim();
+  final teacher = lesson.teacher.trim();
+  return '$name|$location|$teacher|$start';
 }
 
 class ReviewTask {
@@ -1640,4 +1996,281 @@ class _SlotRange {
   _SlotRange(this.start, this.end);
   final int start;
   final int end;
+}
+
+class LessonCapturePage extends StatefulWidget {
+  const LessonCapturePage({
+    super.key,
+    required this.lesson,
+    this.initialSummary,
+  });
+
+  final Lesson lesson;
+  final String? initialSummary;
+
+  @override
+  State<LessonCapturePage> createState() => _LessonCapturePageState();
+}
+
+class _LessonCapturePageState extends State<LessonCapturePage> {
+  late final WebViewController _controller;
+  double _progress = 0;
+  bool _isCapturing = false;
+  final List<String> _segments = [];
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialSummary != null && widget.initialSummary!.trim().isNotEmpty) {
+      _segments.add(widget.initialSummary!.trim());
+    }
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.white)
+      ..setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      )
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onProgress: (value) => setState(() => _progress = value / 100),
+        ),
+      )
+      ..loadRequest(Uri.parse('https://oc.sjtu.edu.cn/'));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final course = widget.lesson.courseName;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('抓取 $course'),
+        actions: [
+          IconButton(
+            onPressed: () => _controller.reload(),
+            icon: const Icon(Icons.refresh),
+            tooltip: '重新加载页面',
+          ),
+        ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(2),
+          child: _progress < 1 ? LinearProgressIndicator(value: _progress) : const SizedBox(height: 2),
+        ),
+      ),
+      body: Column(
+        children: [
+          _buildInstructionBanner(),
+          Expanded(child: WebViewWidget(controller: _controller)),
+          _buildCapturePanel(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInstructionBanner() {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      color: theme.colorScheme.primary.withOpacity(0.07),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: const [
+          Text('操作提示', style: TextStyle(fontWeight: FontWeight.bold)),
+          SizedBox(height: 6),
+          Text('1. 登录 oc.sjtu.edu.cn ，选择对应课程。'),
+          Text('2. 进入“课堂视频(NEW)”并选择今天这节课对应的点播。'),
+          Text('3. 可以多次抓取或手动补充，覆盖跨两节/三节课的内容。'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCapturePanel() {
+    final theme = Theme.of(context);
+    return Material(
+      elevation: 16,
+      color: theme.colorScheme.surface,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _isCapturing ? null : _captureFromWeb,
+                      icon: _isCapturing
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.copy_all_outlined),
+                      label: Text(_isCapturing ? '抓取中...' : '抓取当前页面'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _addManualSegment,
+                      icon: const Icon(Icons.edit_note_outlined),
+                      label: const Text('手动补充'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              _buildSegmentList(),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: _segments.isEmpty ? null : _finishAndReturn,
+                icon: const Icon(Icons.check_circle_outline),
+                label: const Text('完成并返回'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSegmentList() {
+    if (_segments.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 18),
+        decoration: BoxDecoration(
+          color: Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Center(
+          child: Text('尚未添加内容，完成抓取后会出现在这里。'),
+        ),
+      );
+    }
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 180),
+      child: ListView.separated(
+        shrinkWrap: true,
+        itemCount: _segments.length,
+        itemBuilder: (context, index) {
+          final text = _segments[index];
+          return Card(
+            child: ListTile(
+              title: Text('片段 ${index + 1}'),
+              subtitle: Text(
+                text,
+                maxLines: 4,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => setState(() => _segments.removeAt(index)),
+              ),
+            ),
+          );
+        },
+        separatorBuilder: (_, __) => const SizedBox(height: 8),
+      ),
+    );
+  }
+
+  Future<void> _captureFromWeb() async {
+    const script = r'''
+      (function() {
+        const candidates = [
+          document.querySelector('.detail-content'),
+          document.querySelector('.course-content'),
+          document.querySelector('.el-main'),
+          document.querySelector('#app'),
+          document.body
+        ];
+        for (const node of candidates) {
+          if (node && node.innerText && node.innerText.trim().length > 0) {
+            return node.innerText;
+          }
+        }
+        return '';
+      })();
+    ''';
+    setState(() => _isCapturing = true);
+    try {
+      final jsResult = await _controller.runJavaScriptReturningResult(script);
+      final normalized = _normalizeJsResult(jsResult).trim();
+      if (normalized.isEmpty) {
+        throw Exception('未获取到可用文字，请尝试展开课程内容或手动补充');
+      }
+      setState(() {
+        _segments.add(normalized);
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已抓取片段 ${_segments.length}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('抓取失败：$e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isCapturing = false);
+      }
+    }
+  }
+
+  Future<void> _addManualSegment() async {
+    final controller = TextEditingController();
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('手动补充要点'),
+          content: TextField(
+            controller: controller,
+            minLines: 4,
+            maxLines: 6,
+            decoration: const InputDecoration(hintText: '输入课堂重点、老师强调的内容等'),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('取消')),
+            ElevatedButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('保存')),
+          ],
+        );
+      },
+    );
+    if (saved == true && controller.text.trim().isNotEmpty) {
+      setState(() {
+        _segments.add(controller.text.trim());
+      });
+    }
+  }
+
+  void _finishAndReturn() {
+    if (_segments.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请至少抓取或录入一段内容')),
+      );
+      return;
+    }
+    Navigator.of(context).pop(_segments.join('\n\n'));
+  }
+
+  String _normalizeJsResult(Object raw) {
+    final text = raw.toString();
+    if (text.startsWith('"') && text.endsWith('"')) {
+      try {
+        return jsonDecode(text) as String;
+      } catch (_) {
+        return text;
+      }
+    }
+    return text;
+  }
 }
