@@ -1,11 +1,16 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
+import 'package:flutter_markdown/flutter_markdown.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppSecrets.ensureLoaded();
   runApp(const RemindApp());
 }
 
@@ -119,7 +124,10 @@ class _HomeShellState extends State<HomeShell> {
   final GlobalKey<AgendaTabState> _agendaKey = GlobalKey<AgendaTabState>();
   DateTime? _termStartDate;
   static const String _lessonSummaryPrefKey = 'lesson_summaries';
+  static const String _lessonHighlightPrefKey = 'lesson_highlights';
   final Map<String, String> _lessonSummaries = {};
+  final Map<String, String> _lessonHighlights = {};
+  final Set<String> _aiProcessingLessons = {};
 
   @override
   void initState() {
@@ -128,6 +136,7 @@ class _HomeShellState extends State<HomeShell> {
     _scheduleService = ScheduleService(repository: _repository);
     _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
     _loadTermStartDate();
+    _loadLessonHighlights();
     _loadLessonSummaries();
   }
 
@@ -185,6 +194,31 @@ class _HomeShellState extends State<HomeShell> {
     await prefs.setString(_lessonSummaryPrefKey, jsonEncode(_lessonSummaries));
   }
 
+  Future<void> _loadLessonHighlights() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_lessonHighlightPrefKey);
+      if (raw == null) return;
+      final decoded = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      if (!mounted) return;
+      setState(() {
+        _lessonHighlights
+          ..clear()
+          ..addEntries(decoded.entries.map((e) => MapEntry(e.key, e.value.toString())));
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('AI 摘要读取失败：$e')),
+      );
+    }
+  }
+
+  Future<void> _persistLessonHighlights() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_lessonHighlightPrefKey, jsonEncode(_lessonHighlights));
+  }
+
   Future<void> _loadTermStartDate() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -227,11 +261,59 @@ class _HomeShellState extends State<HomeShell> {
     }
     setState(() {
       _lessonSummaries[key] = trimmed;
+      _lessonHighlights.remove(key);
     });
     await _persistLessonSummaries();
+    await _persistLessonHighlights();
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已更新「${lesson.courseName}」的课堂要点')),
+      SnackBar(content: Text('已获取原始内容，开始分析「${lesson.courseName}」')),
     );
+    _analyzeLessonWithAi(key, lesson, trimmed);
+  }
+
+  void _triggerAiAnalysis(Lesson lesson) {
+    final key = lessonStorageKey(lesson);
+    final raw = _lessonSummaries[key];
+    if (raw == null || raw.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先抓取原始内容，再使用 AI 提炼')),
+      );
+      return;
+    }
+    _analyzeLessonWithAi(key, lesson, raw);
+  }
+
+  Future<void> _analyzeLessonWithAi(String key, Lesson lesson, String raw) async {
+    if (_aiProcessingLessons.contains(key)) return;
+    setState(() {
+      _aiProcessingLessons.add(key);
+    });
+    try {
+      final summary = await LessonAiSummarizer.instance.summarize(lesson, raw);
+      if (!mounted) return;
+      setState(() {
+        _lessonHighlights[key] = summary.trim();
+      });
+      await _persistLessonHighlights();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('AI 已完成「${lesson.courseName}」的要点提炼')),
+      );
+    } on LessonAiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('AI 提炼失败：${e.message}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('AI 提炼异常：$e')),
+      );
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _aiProcessingLessons.remove(key);
+      });
+    }
   }
 
   Future<void> _saveTermStartDate(DateTime date) async {
@@ -343,6 +425,9 @@ class _HomeShellState extends State<HomeShell> {
             termStartDate: _termStartDate,
             onCaptureLesson: _openLessonCapture,
             lessonSummaries: _lessonSummaries,
+            lessonHighlights: _lessonHighlights,
+            processingLessons: _aiProcessingLessons,
+            onRequestAiAnalysis: _triggerAiAnalysis,
           ),
           AgendaTab(key: _agendaKey, items: overview.scheduleItems),
           UserTab(
@@ -422,6 +507,9 @@ class TimetableTab extends StatelessWidget {
     this.termStartDate,
     required this.onCaptureLesson,
     required this.lessonSummaries,
+    required this.lessonHighlights,
+    required this.processingLessons,
+    required this.onRequestAiAnalysis,
   });
 
   final List<WeekDayLessons> weekDays;
@@ -429,6 +517,9 @@ class TimetableTab extends StatelessWidget {
   final DateTime? termStartDate;
   final ValueChanged<Lesson> onCaptureLesson;
   final Map<String, String> lessonSummaries;
+  final Map<String, String> lessonHighlights;
+  final Set<String> processingLessons;
+  final ValueChanged<Lesson> onRequestAiAnalysis;
 
   @override
   Widget build(BuildContext context) {
@@ -458,6 +549,9 @@ class TimetableTab extends StatelessWidget {
               currentWeekNumber: currentWeekNumber,
               onCaptureLesson: onCaptureLesson,
               lessonSummaries: lessonSummaries,
+              lessonHighlights: lessonHighlights,
+              processingLessons: processingLessons,
+              onRequestAiAnalysis: onRequestAiAnalysis,
             ),
           ),
         );
@@ -484,6 +578,9 @@ class _TimetableContent extends StatelessWidget {
     this.currentWeekNumber,
     required this.onCaptureLesson,
     required this.lessonSummaries,
+    required this.lessonHighlights,
+    required this.processingLessons,
+    required this.onRequestAiAnalysis,
   });
 
   final List<WeekDayLessons> weekDays;
@@ -493,6 +590,9 @@ class _TimetableContent extends StatelessWidget {
   final int? currentWeekNumber;
   final ValueChanged<Lesson> onCaptureLesson;
   final Map<String, String> lessonSummaries;
+  final Map<String, String> lessonHighlights;
+  final Set<String> processingLessons;
+  final ValueChanged<Lesson> onRequestAiAnalysis;
   @override
   Widget build(BuildContext context) {
     final totalHeight = slotHeight * kTimeSlots.length;
@@ -572,12 +672,17 @@ class _TimetableContent extends StatelessWidget {
                       final top = (span.startIndex - 1) * slotHeight + 4;
                       final height = span.slotCount * slotHeight - 8;
                       final textTheme = Theme.of(context).textTheme;
-                      final storedSummary = lessonSummaries[lessonStorageKey(lesson)];
-                      final summaryText = storedSummary?.trim();
-                      final bool hasCapturedSummary = summaryText != null && summaryText.isNotEmpty;
-                      final remark = hasCapturedSummary
-                          ? '已抓取内容，等待 AI 提炼'
-                          : _formatLessonRemark(lesson.topic);
+                      final key = lessonStorageKey(lesson);
+                      final storedHighlight = lessonHighlights[key]?.trim();
+                      final hasHighlight = storedHighlight != null && storedHighlight.isNotEmpty;
+                      final storedRaw = lessonSummaries[key]?.trim();
+                      final hasCapturedSummary = storedRaw != null && storedRaw.isNotEmpty;
+                      final bool isProcessing = processingLessons.contains(key);
+                      final remark = hasHighlight
+                          ? '已抓取并完成 AI 提炼'
+                          : hasCapturedSummary
+                              ? (isProcessing ? '已抓取内容，AI 分析中…' : '已抓取内容，等待 AI 提炼')
+                              : _formatLessonRemark(lesson.topic);
                       final bool isActive = currentWeekNumber == null
                           ? true
                           : (lesson.weekPattern?.isActive(currentWeekNumber!) ?? true);
@@ -600,8 +705,11 @@ class _TimetableContent extends StatelessWidget {
                               context,
                               lesson,
                               isActive,
-                              summaryText,
+                              storedRaw,
+                              storedHighlight,
+                              isProcessing,
                               onCaptureLesson,
+                              onRequestAiAnalysis,
                             ),
                             child: Container(
                               padding: const EdgeInsets.all(8),
@@ -695,9 +803,13 @@ class _TimetableContent extends StatelessWidget {
     Lesson lesson,
     bool isActive,
     String? capturedSummary,
+    String? aiSummary,
+    bool isProcessing,
     ValueChanged<Lesson> onCaptureLesson,
+    ValueChanged<Lesson> onRequestAiAnalysis,
   ) {
     final hasCaptured = capturedSummary != null && capturedSummary.trim().isNotEmpty;
+    final hasAiSummary = aiSummary != null && aiSummary.trim().isNotEmpty;
     final fallbackRemark = _formatLessonRemark(lesson.topic);
     showModalBottomSheet(
       context: context,
@@ -706,6 +818,10 @@ class _TimetableContent extends StatelessWidget {
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       builder: (ctx) {
+        double clampHeight(double fraction, double min, double max) {
+          final value = MediaQuery.of(ctx).size.height * fraction;
+          return value.clamp(min, max).toDouble();
+        }
         return Padding(
           padding: EdgeInsets.only(
             left: 20,
@@ -757,19 +873,59 @@ class _TimetableContent extends StatelessWidget {
                   ],
                 ),
               const SizedBox(height: 12),
-              if (hasCaptured)
+              if (hasAiSummary)
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '课堂要点（已抓取，待 AI 提炼）',
+                      '课堂要点（AI 摘要）',
                       style: Theme.of(ctx).textTheme.titleMedium,
                     ),
                     const SizedBox(height: 8),
-                    Text(
-                      '原始课堂内容已抓取完毕，待 AI 分析后会在此展示摘要。',
-                      style: Theme.of(ctx).textTheme.bodyMedium,
+                    SizedBox(
+                      height: clampHeight(0.4, 200, 420),
+                      child: Markdown(
+                        data: aiSummary!.trim(),
+                        shrinkWrap: true,
+                        padding: EdgeInsets.zero,
+                      ),
                     ),
+                  ],
+                )
+              else if (hasCaptured)
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('课堂要点', style: Theme.of(ctx).textTheme.titleMedium),
+                    const SizedBox(height: 8),
+                    Text('原始课堂内容已抓取完毕，待 AI 分析后会在此展示摘要。'),
+                    if (isProcessing)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Row(
+                          children: const [
+                            SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 8),
+                            Text('AI 分析进行中…'),
+                          ],
+                        ),
+                      ),
+                    if (!isProcessing)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: OutlinedButton.icon(
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            onRequestAiAnalysis(lesson);
+                          },
+                          icon: const Icon(Icons.auto_awesome),
+                          label: const Text('立即触发 AI 提炼'),
+                        ),
+                      ),
                   ],
                 )
               else if (fallbackRemark != null)
@@ -778,7 +934,15 @@ class _TimetableContent extends StatelessWidget {
                   children: [
                     Text('课堂要点', style: Theme.of(ctx).textTheme.titleMedium),
                     const SizedBox(height: 8),
-                    Text(fallbackRemark, style: Theme.of(ctx).textTheme.bodyMedium),
+                    SizedBox(
+                      height: clampHeight(0.3, 160, 360),
+                      child: SingleChildScrollView(
+                        child: Text(
+                          fallbackRemark,
+                          style: Theme.of(ctx).textTheme.bodyMedium,
+                        ),
+                      ),
+                    ),
                   ],
                 )
               else
@@ -1271,6 +1435,180 @@ class Lesson {
   final String topic;
   final String location;
   final WeekPattern? weekPattern;
+}
+
+class LessonAiException implements Exception {
+  const LessonAiException(this.message);
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+class LessonAiSummarizer {
+  LessonAiSummarizer._();
+  static final LessonAiSummarizer instance = LessonAiSummarizer._();
+  static const String _endpoint = 'https://api.siliconflow.cn/v1/chat/completions';
+  static const String _model = 'deepseek-ai/DeepSeek-V3.2';
+  final http.Client _client = http.Client();
+
+  Future<String> summarize(Lesson lesson, String rawContent) async {
+    await AppSecrets.ensureLoaded();
+    final apiKey = AppSecrets.siliconApiKey;
+    if (apiKey == null || apiKey.isEmpty) {
+      throw const LessonAiException('未找到 SILICONFLOW_API_KEY，请在 .env 或环境变量中配置');
+    }
+    if (rawContent.trim().isEmpty) {
+      throw const LessonAiException('原始课堂内容为空，无法进行分析');
+    }
+    final prep = await _prepareInputs(lesson, rawContent);
+    final userContent = _buildMultimodalContent(lesson, prep);
+    final response = await _client
+        .post(
+          Uri.parse(_endpoint),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $apiKey',
+          },
+          body: jsonEncode({
+            'model': _model,
+            'messages': [
+              {
+                'role': 'system',
+                'content':
+                    '你是一名大学学习助理，需要将课堂内容整理为易于复习的中文要点，语气专业且精炼，分条展示。',
+              },
+              {'role': 'user', 'content': userContent},
+            ],
+            'temperature': 0.2,
+            'max_tokens': 2000,
+          }),
+        )
+        .timeout(const Duration(seconds: 60));
+    if (response.statusCode >= 400) {
+      throw LessonAiException('硅基流动接口异常：${response.statusCode} ${response.body}');
+    }
+    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final choices = decoded['choices'] as List<dynamic>?;
+    if (choices == null || choices.isEmpty) {
+      throw const LessonAiException('AI 没有返回有效内容');
+    }
+    final message = choices.first['message'] as Map<String, dynamic>? ?? {};
+    final content = message['content'] as String? ?? '';
+    if (content.trim().isEmpty) {
+      throw const LessonAiException('AI 返回内容为空');
+    }
+    return content.trim();
+  }
+
+  Future<_LessonAiInputs> _prepareInputs(Lesson lesson, String raw) async {
+    final cleaned = raw.split('\n').map((e) => e.trimRight()).join('\n');
+    final textBuffer = StringBuffer();
+    bool inImageBlock = false;
+    for (final line in cleaned.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.startsWith('【PPT 图片】')) {
+        inImageBlock = true;
+        continue;
+      }
+      if (trimmed.startsWith('【') && trimmed.contains('】') && !trimmed.startsWith('【PPT 图片】')) {
+        inImageBlock = false;
+        continue;
+      }
+      if (inImageBlock) {
+        continue;
+      } else {
+        textBuffer.writeln(line);
+      }
+    }
+    return _LessonAiInputs(textBuffer.toString().trim(), const []);
+  }
+
+  List<Map<String, dynamic>> _buildMultimodalContent(
+    Lesson lesson,
+    _LessonAiInputs inputs,
+  ) {
+    final buffer = StringBuffer()
+      ..writeln('课程：${lesson.courseName}')
+      ..writeln('时间：${_formatTime(lesson.startTime)}-${_formatTime(lesson.endTime)}')
+      ..writeln('地点：${lesson.location}')
+      ..writeln('教师：${lesson.teacher}')
+      ..writeln('\n课堂原始内容：\n${inputs.textContent}')
+      ..writeln('\n请按照以下结构输出：\n1. 课堂概述（2-3 句）\n2. 核心知识点（条目）\n3. 难点与提醒（条目）\n4. 作业或复习建议（条目）');
+    final content = <Map<String, dynamic>>[
+      {'type': 'text', 'text': buffer.toString()},
+    ];
+    return content;
+  }
+
+}
+
+class _LessonAiInputs {
+  _LessonAiInputs(this.textContent, this.images);
+  final String textContent;
+  final List<String> images;
+}
+
+class AppSecrets {
+  static bool _loaded = false;
+  static String? _siliconKey;
+
+  static String? get siliconApiKey => _siliconKey;
+
+  static Future<void> ensureLoaded() async {
+    if (_loaded) return;
+    _loaded = true;
+    final envKey = Platform.environment['SILICONFLOW_API_KEY'];
+    if (_assign(envKey)) return;
+    final defined = const String.fromEnvironment('SILICONFLOW_API_KEY');
+    if (_assign(defined)) return;
+    final fileKey = await _readFromFile();
+    if (_assign(fileKey)) return;
+    final assetKey = await _readFromAsset();
+    _assign(assetKey);
+  }
+
+  static bool _assign(String? value) {
+    if (value == null) return false;
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) return false;
+    _siliconKey = trimmed;
+    return true;
+  }
+
+  static Future<String?> _readFromFile() async {
+    try {
+      final file = File('.env');
+      if (!await file.exists()) return null;
+      final content = await file.readAsString();
+      return _extractKey(content);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<String?> _readFromAsset() async {
+    try {
+      final content = await rootBundle.loadString('.env');
+      return _extractKey(content);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static String? _extractKey(String content) {
+    for (final line in content.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.startsWith('#') || trimmed.isEmpty) continue;
+      final parts = trimmed.split('=');
+      if (parts.length < 2) continue;
+      final key = parts.first.trim();
+      if (key == 'SILICONFLOW_API_KEY') {
+        return parts.sublist(1).join('=').trim();
+      }
+    }
+    return null;
+  }
 }
 
 String lessonStorageKey(Lesson lesson) {
