@@ -123,8 +123,10 @@ class _HomeShellState extends State<HomeShell> {
   late ScheduleRepository _repository;
   final GlobalKey<AgendaTabState> _agendaKey = GlobalKey<AgendaTabState>();
   DateTime? _termStartDate;
+  DateTime _displayedWeekAnchor = DateTime.now();
   static const String _lessonSummaryPrefKey = 'lesson_summaries';
   static const String _lessonHighlightPrefKey = 'lesson_highlights';
+  static const String _userLessonsPrefKey = 'user_lessons';
   final Map<String, String> _lessonSummaries = {};
   final Map<String, String> _lessonHighlights = {};
   final Set<String> _aiProcessingLessons = {};
@@ -132,27 +134,24 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void initState() {
     super.initState();
+    _displayedWeekAnchor = DateTime.now();
     _repository = MockScheduleRepository();
     _scheduleService = ScheduleService(repository: _repository);
-    _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
+    _overviewFuture = _scheduleService.loadWeekOverview(_displayedWeekAnchor);
     _loadTermStartDate();
     _loadLessonHighlights();
     _loadLessonSummaries();
+    _loadPersistedLessons();
   }
 
   void _reload() {
-    setState(() {
-      _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
-    });
+    _loadWeek(_displayedWeekAnchor);
   }
 
-  void _applyImportedLessons(List<Lesson> lessons) {
-    setState(() {
-      _repository = MemoryScheduleRepository(lessons: lessons);
-      _scheduleService = ScheduleService(repository: _repository);
-      _overviewFuture = _scheduleService.loadWeekOverview(DateTime.now());
-      _currentIndex = 0;
-    });
+  Future<void> _applyImportedLessons(List<Lesson> lessons) async {
+    await _persistLessons(lessons);
+    _useLessonRepository(lessons, showSnack: false);
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text('成功导入${lessons.length}条课程，已替换课表'),
@@ -161,10 +160,82 @@ class _HomeShellState extends State<HomeShell> {
     );
   }
 
+  void _useLessonRepository(List<Lesson> lessons, {bool showSnack = true}) {
+    setState(() {
+      _repository = MemoryScheduleRepository(lessons: lessons);
+      _scheduleService = ScheduleService(repository: _repository);
+    });
+    _loadWeek(_displayedWeekAnchor);
+    setState(() {
+      _currentIndex = 0;
+    });
+    if (showSnack && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已切换到用户课程表，共${lessons.length}条课程'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  void _loadWeek(DateTime anchor) {
+    setState(() {
+      _displayedWeekAnchor = anchor;
+      _overviewFuture = _scheduleService.loadWeekOverview(anchor);
+    });
+  }
+
+  void _shiftWeek(int delta) {
+    final anchor = _displayedWeekAnchor.add(Duration(days: delta * 7));
+    _loadWeek(anchor);
+  }
+
+  void _resetToCurrentWeek() {
+    _loadWeek(DateTime.now());
+  }
+
+  List<Widget> _buildAppBarActions() {
+    if (_currentIndex == 0) {
+      return [
+        IconButton(
+          onPressed: () => _shiftWeek(-1),
+          icon: const Icon(Icons.chevron_left),
+          tooltip: '上一周',
+        ),
+        TextButton(
+          onPressed: _resetToCurrentWeek,
+          child: const Text('本周'),
+        ),
+        IconButton(
+          onPressed: () => _shiftWeek(1),
+          icon: const Icon(Icons.chevron_right),
+          tooltip: '下一周',
+        ),
+        IconButton(onPressed: _reload, icon: const Icon(Icons.refresh), tooltip: '刷新数据'),
+      ];
+    }
+    if (_currentIndex != 2) {
+      return [IconButton(onPressed: _reload, icon: const Icon(Icons.refresh), tooltip: '刷新数据')];
+    }
+    return const [];
+  }
+
+  String _formatWeekRangeLabel(List<WeekDayLessons> days) {
+    if (days.isEmpty) return '';
+    final first = days.first.date;
+    final last = days.last.date;
+    final range = '${first.month}/${first.day} - ${last.month}/${last.day}';
+    return range;
+  }
+
   Future<void> _openWebImport() async {
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (ctx) => WebImportPage(onImported: _applyImportedLessons),
+        builder: (ctx) => WebImportPage(
+          onImported: _applyImportedLessons,
+          termStartDate: _termStartDate,
+        ),
       ),
     );
   }
@@ -192,6 +263,36 @@ class _HomeShellState extends State<HomeShell> {
   Future<void> _persistLessonSummaries() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_lessonSummaryPrefKey, jsonEncode(_lessonSummaries));
+  }
+
+  Future<void> _loadPersistedLessons() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_userLessonsPrefKey);
+      if (raw == null) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return;
+      final lessons = decoded
+          .map((e) => Lesson.fromJson(Map<String, dynamic>.from(e as Map)))
+          .whereType<Lesson>()
+          .toList();
+      if (lessons.isEmpty) return;
+      if (!mounted) return;
+      _useLessonRepository(lessons, showSnack: false);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('用户课程加载失败：$e')),
+      );
+    }
+  }
+
+  Future<void> _persistLessons(List<Lesson> lessons) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _userLessonsPrefKey,
+      jsonEncode(lessons.map((e) => e.toJson()).toList()),
+    );
   }
 
   Future<void> _loadLessonHighlights() async {
@@ -352,11 +453,11 @@ class _HomeShellState extends State<HomeShell> {
     }
   }
 
-  int? _currentWeekNumber() {
+  int? _weekNumberFor(DateTime anchor) {
     if (_termStartDate == null) return null;
     final normalizedStart = DateTime(_termStartDate!.year, _termStartDate!.month, _termStartDate!.day);
-    final now = DateTime.now();
-    final diff = now.difference(normalizedStart);
+    final monday = anchor.subtract(Duration(days: anchor.weekday - 1));
+    final diff = monday.difference(normalizedStart);
     final week = diff.inDays ~/ 7 + 1;
     return week <= 0 ? 1 : week;
   }
@@ -380,11 +481,15 @@ class _HomeShellState extends State<HomeShell> {
           ),
         );
 
+        final appBarTitle = _currentIndex == 0
+            ? Text('课程表 · ${_weekNumberFor(_displayedWeekAnchor) != null ? '第${_weekNumberFor(_displayedWeekAnchor)}周' : '尚未设置开学日期'}')
+            : Text(titles[_currentIndex]);
+
         if (snapshot.connectionState == ConnectionState.waiting) {
           return Scaffold(
             appBar: AppBar(
-              title: Text(titles[_currentIndex]),
-              actions: [IconButton(onPressed: _reload, icon: const Icon(Icons.refresh))],
+              title: appBarTitle,
+              actions: _buildAppBarActions(),
             ),
             body: Stack(children: [gradientBackground, const Center(child: CircularProgressIndicator())]),
           );
@@ -393,8 +498,8 @@ class _HomeShellState extends State<HomeShell> {
         if (snapshot.hasError) {
           return Scaffold(
             appBar: AppBar(
-              title: Text(titles[_currentIndex]),
-              actions: [IconButton(onPressed: _reload, icon: const Icon(Icons.refresh))],
+              title: appBarTitle,
+              actions: _buildAppBarActions(),
             ),
             body: Stack(
               children: [
@@ -417,7 +522,7 @@ class _HomeShellState extends State<HomeShell> {
         }
 
         final overview = snapshot.data!;
-        final weekNumber = _currentWeekNumber();
+        final weekNumber = _weekNumberFor(_displayedWeekAnchor);
         final pages = [
           TimetableTab(
             weekDays: overview.weekDays,
@@ -452,7 +557,11 @@ class _HomeShellState extends State<HomeShell> {
                 ? Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('课程表 · $weekTitle'),
+                      Text(weekTitle, style: Theme.of(context).textTheme.titleLarge),
+                      Text(
+                        '${_formatWeekRangeLabel(overview.weekDays)}',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
                       if (startLabel != null)
                         Text(
                           '开学日：$startLabel',
@@ -461,10 +570,7 @@ class _HomeShellState extends State<HomeShell> {
                     ],
                   )
                 : Text(titles[_currentIndex]),
-            actions: [
-              if (_currentIndex != 2)
-                IconButton(onPressed: _reload, icon: const Icon(Icons.refresh), tooltip: '刷新数据'),
-            ],
+            actions: _buildAppBarActions(),
           ),
           body: Stack(
             children: [
@@ -1435,6 +1541,32 @@ class Lesson {
   final String topic;
   final String location;
   final WeekPattern? weekPattern;
+
+  Map<String, dynamic> toJson() => {
+        'courseName': courseName,
+        'teacher': teacher,
+        'startTime': startTime.millisecondsSinceEpoch,
+        'endTime': endTime.millisecondsSinceEpoch,
+        'topic': topic,
+        'location': location,
+        'weekPattern': weekPattern?.toJson(),
+      };
+
+  static Lesson? fromJson(Map<String, dynamic> json) {
+    try {
+      return Lesson(
+        courseName: json['courseName']?.toString() ?? '',
+        teacher: json['teacher']?.toString() ?? '',
+        startTime: DateTime.fromMillisecondsSinceEpoch(json['startTime'] as int),
+        endTime: DateTime.fromMillisecondsSinceEpoch(json['endTime'] as int),
+        topic: json['topic']?.toString() ?? '',
+        location: json['location']?.toString() ?? '',
+        weekPattern: WeekPattern.fromJson(json['weekPattern']),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
 class LessonAiException implements Exception {
@@ -1669,6 +1801,31 @@ class WeekPattern {
             ? '仅双周'
             : '';
     return [range, parityLabel].where((e) => e.isNotEmpty).join(' · ');
+  }
+
+  Map<String, dynamic> toJson() => {
+        'startWeek': startWeek,
+        'endWeek': endWeek,
+        'parity': parity.name,
+      };
+
+  static WeekPattern? fromJson(dynamic json) {
+    if (json == null) return null;
+    if (json is! Map) return null;
+    final map = Map<String, dynamic>.from(json);
+    final parityName = map['parity']?.toString();
+    WeekParity parity = WeekParity.any;
+    if (parityName != null) {
+      parity = WeekParity.values.firstWhere(
+        (p) => p.name == parityName,
+        orElse: () => WeekParity.any,
+      );
+    }
+    return WeekPattern(
+      startWeek: map['startWeek'] as int?,
+      endWeek: map['endWeek'] as int?,
+      parity: parity,
+    );
   }
 }
 
@@ -2007,15 +2164,23 @@ String? _formatLessonRemark(String remark) {
 }
 
 class WebImportPage extends StatefulWidget {
-  const WebImportPage({super.key, required this.onImported});
+  const WebImportPage({
+    super.key,
+    required this.onImported,
+    this.termStartDate,
+  });
 
   final ValueChanged<List<Lesson>> onImported;
+  final DateTime? termStartDate;
 
   @override
   State<WebImportPage> createState() => _WebImportPageState();
 }
 
 class _WebImportPageState extends State<WebImportPage> {
+  static const int _defaultWeekCount = 20;
+  static const int _maxWeekCount = 30;
+
   late final WebViewController _controller;
   double _progress = 0;
   bool _isExtracting = false;
@@ -2201,18 +2366,59 @@ class _WebImportPageState extends State<WebImportPage> {
   }
 
   List<Lesson> _convertToLessons(List<Map<String, dynamic>> rawCourses) {
-    final monday = _currentWeekMonday();
-    final results = <Lesson>[];
+    final templates = <_LessonTemplate>[];
     for (final course in rawCourses) {
-      final lesson = _mapCourseToLesson(course, monday);
-      if (lesson != null) {
-        results.add(lesson);
+      final template = _mapCourseToTemplate(course);
+      if (template != null) {
+        templates.add(template);
       }
     }
-    return results;
+    return _expandTemplates(templates);
   }
 
-  Lesson? _mapCourseToLesson(Map<String, dynamic> course, DateTime monday) {
+  List<Lesson> _expandTemplates(List<_LessonTemplate> templates) {
+    if (templates.isEmpty) return [];
+    if (widget.termStartDate == null) {
+      final monday = _currentWeekMonday();
+      return templates
+          .map(
+            (tpl) => tpl.buildForDate(monday.add(Duration(days: tpl.dayOffset))),
+          )
+          .toList();
+    }
+    final normalizedStart = DateTime(
+      widget.termStartDate!.year,
+      widget.termStartDate!.month,
+      widget.termStartDate!.day,
+    );
+    final lessons = <Lesson>[];
+    for (final template in templates) {
+      final pattern = template.weekPattern;
+      int startWeek = pattern?.startWeek ?? 1;
+      if (startWeek < 1) startWeek = 1;
+      if (startWeek > _maxWeekCount) startWeek = _maxWeekCount;
+      int endWeek = pattern?.endWeek ?? _defaultWeekCount;
+      if (endWeek < startWeek) {
+        endWeek = startWeek;
+      }
+      if (endWeek > _maxWeekCount) {
+        endWeek = _maxWeekCount;
+      }
+      final fallbackEnd = startWeek > _defaultWeekCount ? startWeek : _defaultWeekCount;
+      if (pattern?.endWeek == null && endWeek < fallbackEnd) {
+        endWeek = fallbackEnd;
+      }
+      for (var week = startWeek; week <= endWeek; week++) {
+        if (pattern != null && !pattern.isActive(week)) continue;
+        final date = normalizedStart.add(Duration(days: (week - 1) * 7 + template.dayOffset));
+        lessons.add(template.buildForDate(date));
+      }
+    }
+    lessons.sort((a, b) => a.startTime.compareTo(b.startTime));
+    return lessons;
+  }
+
+  _LessonTemplate? _mapCourseToTemplate(Map<String, dynamic> course) {
     final info = Map<String, dynamic>.from(course['info'] as Map? ?? {});
     final rowSpan = int.tryParse('${course['rowSpan'] ?? ''}');
     final slotText = _firstText(info['节/周']) ?? _firstText(info['节次']);
@@ -2223,10 +2429,6 @@ class _WebImportPageState extends State<WebImportPage> {
     final endSlot = _slotByIndex(slotRange.end);
     if (startSlot == null || endSlot == null) return null;
 
-    final date = monday.add(Duration(days: dayOffset));
-    final startTime = DateTime(date.year, date.month, date.day, startSlot.start.hour, startSlot.start.minute);
-    final endTime = DateTime(date.year, date.month, date.day, endSlot.end.hour, endSlot.end.minute);
-
     final teachers = _normalizeList(info['教师']);
     final teacherLabel = teachers.isEmpty ? '' : teachers.join(' / ');
 
@@ -2234,13 +2436,14 @@ class _WebImportPageState extends State<WebImportPage> {
     final topicText = topics.isEmpty ? (_firstText(info['节/周']) ?? '') : topics.join(' / ');
     final weekPattern = _parseWeekPattern(_firstText(info['节/周']));
 
-    return Lesson(
+    return _LessonTemplate(
       courseName: _firstText(course['title']) ?? _firstText(info['教学班名称']) ?? '课程',
       teacher: teacherLabel,
-      startTime: startTime,
-      endTime: endTime,
       topic: topicText,
       location: _firstText(info['上课地点']) ?? '',
+      dayOffset: dayOffset,
+      startTime: startSlot.start,
+      endTime: endSlot.end,
       weekPattern: weekPattern,
     );
   }
@@ -2357,6 +2560,42 @@ class _SlotRange {
   _SlotRange(this.start, this.end);
   final int start;
   final int end;
+}
+
+class _LessonTemplate {
+  const _LessonTemplate({
+    required this.courseName,
+    required this.teacher,
+    required this.topic,
+    required this.location,
+    required this.dayOffset,
+    required this.startTime,
+    required this.endTime,
+    this.weekPattern,
+  });
+
+  final String courseName;
+  final String teacher;
+  final String topic;
+  final String location;
+  final int dayOffset;
+  final TimeOfDay startTime;
+  final TimeOfDay endTime;
+  final WeekPattern? weekPattern;
+
+  Lesson buildForDate(DateTime date) {
+    final start = DateTime(date.year, date.month, date.day, startTime.hour, startTime.minute);
+    final end = DateTime(date.year, date.month, date.day, endTime.hour, endTime.minute);
+    return Lesson(
+      courseName: courseName,
+      teacher: teacher,
+      startTime: start,
+      endTime: end,
+      topic: topic,
+      location: location,
+      weekPattern: weekPattern,
+    );
+  }
 }
 
 class LessonCapturePage extends StatefulWidget {
