@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -127,20 +128,28 @@ class _HomeShellState extends State<HomeShell> {
   static const String _lessonSummaryPrefKey = 'lesson_summaries';
   static const String _lessonHighlightPrefKey = 'lesson_highlights';
   static const String _userLessonsPrefKey = 'user_lessons';
+  static const String _reviewTaskPrefKey = 'review_tasks';
   final Map<String, String> _lessonSummaries = {};
   final Map<String, String> _lessonHighlights = {};
   final Set<String> _aiProcessingLessons = {};
+  final Map<String, List<ReviewTask>> _reviewPlans = {};
+  final Set<String> _reviewPlanningLessons = {};
 
   @override
   void initState() {
     super.initState();
     _displayedWeekAnchor = DateTime.now();
     _repository = MockScheduleRepository();
-    _scheduleService = ScheduleService(repository: _repository);
+    _scheduleService = ScheduleService(
+      repository: _repository,
+      reviewTaskProvider: _reviewTasksForDate,
+      enableAutoReviewPlan: false,
+    );
     _overviewFuture = _scheduleService.loadWeekOverview(_displayedWeekAnchor);
     _loadTermStartDate();
     _loadLessonHighlights();
     _loadLessonSummaries();
+    _loadReviewPlans();
     _loadPersistedLessons();
   }
 
@@ -163,7 +172,11 @@ class _HomeShellState extends State<HomeShell> {
   void _useLessonRepository(List<Lesson> lessons, {bool showSnack = true}) {
     setState(() {
       _repository = MemoryScheduleRepository(lessons: lessons);
-      _scheduleService = ScheduleService(repository: _repository);
+      _scheduleService = ScheduleService(
+        repository: _repository,
+        reviewTaskProvider: _reviewTasksForDate,
+        enableAutoReviewPlan: false,
+      );
     });
     _loadWeek(_displayedWeekAnchor);
     setState(() {
@@ -193,6 +206,36 @@ class _HomeShellState extends State<HomeShell> {
 
   void _resetToCurrentWeek() {
     _loadWeek(DateTime.now());
+  }
+
+  List<ReviewTask> _reviewTasksForDate(DateTime date) {
+    final target = DateTime(date.year, date.month, date.day);
+    return _reviewPlans.values.expand((tasks) => tasks).where((task) => _isSameDay(task.scheduledAt, target)).toList();
+  }
+
+  void _removeReviewTaskByKey(String key) async {
+    bool changed = false;
+    setState(() {
+      final keysToRemove = <String>[];
+      _reviewPlans.forEach((lessonKey, tasks) {
+        final before = tasks.length;
+        tasks.removeWhere((task) => reviewTaskStorageKey(task) == key);
+        final removed = before != tasks.length;
+        if (removed) {
+          changed = true;
+        }
+        if (tasks.isEmpty) {
+          keysToRemove.add(lessonKey);
+        }
+      });
+      for (final lessonKey in keysToRemove) {
+        _reviewPlans.remove(lessonKey);
+      }
+    });
+    if (changed) {
+      await _persistReviewPlans();
+      _reload();
+    }
   }
 
   List<Widget> _buildAppBarActions() {
@@ -315,6 +358,50 @@ class _HomeShellState extends State<HomeShell> {
     }
   }
 
+  Future<void> _loadReviewPlans() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_reviewTaskPrefKey);
+      if (raw == null) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return;
+      final tasks = decoded
+          .map((e) => ReviewTask.fromJson(Map<String, dynamic>.from(e as Map)))
+          .whereType<ReviewTask>()
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _reviewPlans
+          ..clear()
+          ..addAll(_groupReviewTasksByLesson(tasks));
+      });
+      _reload();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('复习计划读取失败：$e')),
+      );
+    }
+  }
+
+  Map<String, List<ReviewTask>> _groupReviewTasksByLesson(List<ReviewTask> tasks) {
+    final map = <String, List<ReviewTask>>{};
+    for (final task in tasks) {
+      final key = task.lessonKey.isNotEmpty ? task.lessonKey : '_misc';
+      map.putIfAbsent(key, () => []).add(task);
+    }
+    for (final entry in map.entries) {
+      entry.value.sort((a, b) => a.scheduledAt.compareTo(b.scheduledAt));
+    }
+    return map;
+  }
+
+  Future<void> _persistReviewPlans() async {
+    final prefs = await SharedPreferences.getInstance();
+    final flattened = _reviewPlans.values.expand((e) => e).map((e) => e.toJson()).toList();
+    await prefs.setString(_reviewTaskPrefKey, jsonEncode(flattened));
+  }
+
   Future<void> _persistLessonHighlights() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_lessonHighlightPrefKey, jsonEncode(_lessonHighlights));
@@ -382,6 +469,146 @@ class _HomeShellState extends State<HomeShell> {
       return;
     }
     _analyzeLessonWithAi(key, lesson, raw);
+  }
+
+  Future<void> _generateReviewPlan(Lesson lesson) async {
+    final lessonKey = lessonStorageKey(lesson);
+    final aiSummary = _lessonHighlights[lessonKey]?.trim();
+    final rawContent = _lessonSummaries[lessonKey]?.trim();
+    final source = (aiSummary != null && aiSummary.isNotEmpty)
+        ? aiSummary
+        : rawContent != null && rawContent.isNotEmpty
+            ? rawContent
+            : null;
+    if (source == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先抓取并完成 AI 提炼后再生成复习日程')),
+      );
+      return;
+    }
+    if (_reviewPlanningLessons.contains(lessonKey)) return;
+    setState(() {
+      _reviewPlanningLessons.add(lessonKey);
+    });
+    try {
+      final suggestions = await LessonReviewPlanGenerator.instance.generate(lesson, source);
+      final tasks = await _scheduleReviewTasks(lesson, suggestions);
+      if (!mounted) return;
+      setState(() {
+        if (tasks.isEmpty) {
+          _reviewPlans.remove(lessonKey);
+        } else {
+          _reviewPlans[lessonKey] = tasks;
+        }
+      });
+      await _persistReviewPlans();
+      _reload();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已生成${tasks.length}条复习日程')),
+      );
+    } on LessonAiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('生成复习日程失败：${e.message}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('生成复习日程异常：$e')),
+      );
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _reviewPlanningLessons.remove(lessonKey);
+      });
+    }
+  }
+
+  Future<List<ReviewTask>> _scheduleReviewTasks(
+    Lesson lesson,
+    List<ReviewPlanSuggestion> suggestions,
+  ) async {
+    if (suggestions.isEmpty) return [];
+    final lessonKey = lessonStorageKey(lesson);
+    final cache = <int, List<Lesson>>{};
+    final results = <ReviewTask>[];
+    final occupied = _reviewPlans.entries
+        .where((entry) => entry.key != lessonKey)
+        .expand((entry) => entry.value)
+        .toList();
+    final baseTime = lesson.endTime;
+    for (var i = 0; i < suggestions.length; i++) {
+      final suggestion = suggestions[i];
+      final interval = _intervalForSuggestion(i);
+      var desired = baseTime.add(interval);
+      desired = await _findAvailableReviewSlot(desired, Duration(minutes: suggestion.durationMinutes), cache, occupied);
+      final offset = desired.difference(lesson.endTime);
+      final task = ReviewTask(
+        courseName: lesson.courseName,
+        scheduledAt: desired,
+        offsetFromLesson: offset,
+        focus: suggestion.topic,
+        note: suggestion.tip,
+        method: suggestion.method,
+        durationMinutes: suggestion.durationMinutes,
+        lessonKey: lessonKey,
+        aiAdvice: suggestion.tip,
+      );
+      results.add(task);
+      occupied.add(task);
+    }
+    results.sort((a, b) => a.scheduledAt.compareTo(b.scheduledAt));
+    return results;
+  }
+
+  Duration _intervalForSuggestion(int index) {
+    if (index < kReviewPlanIntervals.length) return kReviewPlanIntervals[index];
+    final extraWeeks = index - kReviewPlanIntervals.length + 1;
+    return kReviewPlanIntervals.last + Duration(days: extraWeeks * 7);
+  }
+
+  Future<DateTime> _findAvailableReviewSlot(
+    DateTime desiredStart,
+    Duration duration,
+    Map<int, List<Lesson>> lessonCache,
+    List<ReviewTask> occupied,
+  ) async {
+    DateTime start = desiredStart;
+    for (var attempt = 0; attempt < 24; attempt++) {
+      final normalizedDay = DateTime(start.year, start.month, start.day);
+      final cacheKey = normalizedDay.millisecondsSinceEpoch;
+      List<Lesson> lessons;
+      if (lessonCache.containsKey(cacheKey)) {
+        lessons = lessonCache[cacheKey]!;
+      } else {
+        lessons = await _repository.fetchLessonsForDate(normalizedDay);
+        lessonCache[cacheKey] = lessons;
+      }
+      var end = start.add(duration);
+      final restWindow = _findRestOverlap(start, end);
+      if (restWindow != null) {
+        start = restWindow.end.add(const Duration(minutes: 5));
+        continue;
+      }
+      end = start.add(duration);
+      final hasLessonConflict = lessons.any(
+        (l) {
+          final bufferedStart = l.startTime.subtract(kScheduleBuffer);
+          final bufferedEnd = l.endTime.add(kScheduleBuffer);
+          return _timeOverlap(bufferedStart, bufferedEnd, start, end);
+        },
+      );
+      final hasTaskConflict = occupied.any((task) {
+        final tStart = task.scheduledAt.subtract(kScheduleBuffer);
+        final tEnd = task.scheduledAt.add(Duration(minutes: task.durationMinutes)).add(kScheduleBuffer);
+        return _timeOverlap(tStart, tEnd, start, end);
+      });
+      if (!hasLessonConflict && !hasTaskConflict) {
+        return start;
+      }
+      start = start.add(const Duration(minutes: 45));
+    }
+    return desiredStart;
   }
 
   Future<void> _analyzeLessonWithAi(String key, Lesson lesson, String raw) async {
@@ -533,8 +760,17 @@ class _HomeShellState extends State<HomeShell> {
             lessonHighlights: _lessonHighlights,
             processingLessons: _aiProcessingLessons,
             onRequestAiAnalysis: _triggerAiAnalysis,
+            reviewPlans: _reviewPlans,
+            planningLessons: _reviewPlanningLessons,
+            onGenerateReviewPlan: _generateReviewPlan,
           ),
-          AgendaTab(key: _agendaKey, items: overview.scheduleItems),
+          AgendaTab(
+            key: _agendaKey,
+            items: overview.scheduleItems,
+            currentDate: _displayedWeekAnchor,
+            onDateChange: (date) => _loadWeek(date),
+            onDeleteAutoTask: _removeReviewTaskByKey,
+          ),
           UserTab(
             onOpenImport: _openWebImport,
             onPickTermStart: () => _pickTermStartDate(context),
@@ -616,6 +852,9 @@ class TimetableTab extends StatelessWidget {
     required this.lessonHighlights,
     required this.processingLessons,
     required this.onRequestAiAnalysis,
+    required this.reviewPlans,
+    required this.planningLessons,
+    required this.onGenerateReviewPlan,
   });
 
   final List<WeekDayLessons> weekDays;
@@ -626,6 +865,9 @@ class TimetableTab extends StatelessWidget {
   final Map<String, String> lessonHighlights;
   final Set<String> processingLessons;
   final ValueChanged<Lesson> onRequestAiAnalysis;
+  final Map<String, List<ReviewTask>> reviewPlans;
+  final Set<String> planningLessons;
+  final ValueChanged<Lesson> onGenerateReviewPlan;
 
   @override
   Widget build(BuildContext context) {
@@ -658,6 +900,9 @@ class TimetableTab extends StatelessWidget {
               lessonHighlights: lessonHighlights,
               processingLessons: processingLessons,
               onRequestAiAnalysis: onRequestAiAnalysis,
+              reviewPlans: reviewPlans,
+              planningLessons: planningLessons,
+              onGenerateReviewPlan: onGenerateReviewPlan,
             ),
           ),
         );
@@ -687,6 +932,9 @@ class _TimetableContent extends StatelessWidget {
     required this.lessonHighlights,
     required this.processingLessons,
     required this.onRequestAiAnalysis,
+    required this.reviewPlans,
+    required this.planningLessons,
+    required this.onGenerateReviewPlan,
   });
 
   final List<WeekDayLessons> weekDays;
@@ -699,6 +947,9 @@ class _TimetableContent extends StatelessWidget {
   final Map<String, String> lessonHighlights;
   final Set<String> processingLessons;
   final ValueChanged<Lesson> onRequestAiAnalysis;
+  final Map<String, List<ReviewTask>> reviewPlans;
+  final Set<String> planningLessons;
+  final ValueChanged<Lesson> onGenerateReviewPlan;
   @override
   Widget build(BuildContext context) {
     final totalHeight = slotHeight * kTimeSlots.length;
@@ -816,6 +1067,9 @@ class _TimetableContent extends StatelessWidget {
                               isProcessing,
                               onCaptureLesson,
                               onRequestAiAnalysis,
+                              reviewPlans,
+                              planningLessons,
+                              onGenerateReviewPlan,
                             ),
                             child: Container(
                               padding: const EdgeInsets.all(8),
@@ -913,10 +1167,17 @@ class _TimetableContent extends StatelessWidget {
     bool isProcessing,
     ValueChanged<Lesson> onCaptureLesson,
     ValueChanged<Lesson> onRequestAiAnalysis,
+    Map<String, List<ReviewTask>> reviewPlans,
+    Set<String> planningLessons,
+    ValueChanged<Lesson> onGenerateReviewPlan,
   ) {
     final hasCaptured = capturedSummary != null && capturedSummary.trim().isNotEmpty;
     final hasAiSummary = aiSummary != null && aiSummary.trim().isNotEmpty;
     final fallbackRemark = _formatLessonRemark(lesson.topic);
+    final lessonKey = lessonStorageKey(lesson);
+    final reviewTasks = reviewPlans[lessonKey] ?? const <ReviewTask>[];
+    final isPlanningReview = planningLessons.contains(lessonKey);
+    final canGenerateReviewPlan = hasAiSummary || hasCaptured;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -928,14 +1189,16 @@ class _TimetableContent extends StatelessWidget {
           final value = MediaQuery.of(ctx).size.height * fraction;
           return value.clamp(min, max).toDouble();
         }
-        return Padding(
+        return SingleChildScrollView(
           padding: EdgeInsets.only(
             left: 20,
             right: 20,
             bottom: 20 + MediaQuery.of(ctx).viewInsets.bottom,
             top: 20,
           ),
-          child: Wrap(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
               Row(
                 children: [
@@ -1091,6 +1354,61 @@ class _TimetableContent extends StatelessWidget {
                   ],
                 ],
               ),
+              const SizedBox(height: 20),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('复习日程', style: Theme.of(ctx).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  if (reviewTasks.isEmpty)
+                    Text(
+                      canGenerateReviewPlan ? '尚未生成复习日程，点击下方按钮即可根据 AI 要点自动生成。' : '请先完成抓取或 AI 提炼，才能生成复习日程。',
+                      style: Theme.of(ctx).textTheme.bodyMedium,
+                    )
+                  else
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: MediaQuery.of(ctx).size.height * 0.25,
+                      ),
+                      child: ListView.separated(
+                        physics: const ClampingScrollPhysics(),
+                        shrinkWrap: true,
+                        itemCount: reviewTasks.length,
+                        separatorBuilder: (_, __) => const Divider(height: 8),
+                        itemBuilder: (context, index) {
+                          final task = reviewTasks[index];
+                          final timeLabel =
+                              '${task.scheduledAt.month}/${task.scheduledAt.day} ${_formatTime(task.scheduledAt)}';
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: const Icon(Icons.task_alt_outlined),
+                            title: Text('${task.focus} (${task.method ?? '复习'})'),
+                            subtitle: Text('$timeLabel · 建议${task.durationMinutes}分钟'),
+                            dense: true,
+                          );
+                        },
+                      ),
+                    ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: !canGenerateReviewPlan || isPlanningReview
+                        ? null
+                        : () {
+                            Navigator.of(ctx).pop();
+                            onGenerateReviewPlan(lesson);
+                          },
+                    icon: isPlanningReview
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Icon(reviewTasks.isEmpty ? Icons.auto_fix_high : Icons.refresh),
+                    label: Text(reviewTasks.isEmpty ? '生成复习日程' : '重新生成复习日程'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
             ],
           ),
         );
@@ -1100,21 +1418,140 @@ class _TimetableContent extends StatelessWidget {
 }
 
 class AgendaTab extends StatefulWidget {
-  const AgendaTab({super.key, required this.items});
+  const AgendaTab({
+    super.key,
+    required this.items,
+    required this.currentDate,
+    required this.onDateChange,
+    required this.onDeleteAutoTask,
+  });
 
   final List<ScheduleItem> items;
+  final DateTime currentDate;
+  final ValueChanged<DateTime> onDateChange;
+  final ValueChanged<String> onDeleteAutoTask;
 
   @override
   State<AgendaTab> createState() => AgendaTabState();
 }
 
 class AgendaTabState extends State<AgendaTab> {
+  static const String _manualAgendaPrefKey = 'manual_agenda_items';
+
   late List<ScheduleItem> _items;
+  int _transitionDirection = 0;
+  final Map<String, List<ScheduleItem>> _manualItems = {};
+  bool _shouldResetDirection = false;
 
   @override
   void initState() {
     super.initState();
-    _items = List.of(widget.items);
+    _items = _buildMergedItems(widget.currentDate, widget.items);
+    _loadManualItems();
+  }
+
+  @override
+  void didUpdateWidget(covariant AgendaTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final dateChanged = !_isSameDay(oldWidget.currentDate, widget.currentDate);
+    if (dateChanged || !listEquals(oldWidget.items, widget.items)) {
+      setState(() {
+        _items = _buildMergedItems(widget.currentDate, widget.items);
+      });
+    }
+    if (dateChanged) {
+      _shouldResetDirection = true;
+    }
+  }
+
+  List<ScheduleItem> _buildMergedItems(DateTime date, List<ScheduleItem> base) {
+    final key = _dateKey(date);
+    final merged = [...base];
+    final manuals = _manualItems[key];
+    if (manuals != null && manuals.isNotEmpty) {
+      merged.addAll(manuals);
+    }
+    merged.sort((a, b) => a.time.compareTo(b.time));
+    return merged;
+  }
+
+  String _dateKey(DateTime date) {
+    return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _loadManualItems() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_manualAgendaPrefKey);
+    if (raw == null) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      final map = <String, List<ScheduleItem>>{};
+      decoded.forEach((key, value) {
+        if (value is List) {
+          final list = value
+              .map((e) => _manualItemFromJson(Map<String, dynamic>.from(e as Map)))
+              .whereType<ScheduleItem>()
+              .toList();
+          if (list.isNotEmpty) {
+            map[key.toString()] = list;
+          }
+        }
+      });
+      if (!mounted) return;
+      setState(() {
+        _manualItems
+          ..clear()
+          ..addAll(map);
+        _items = _buildMergedItems(widget.currentDate, widget.items);
+      });
+    } catch (_) {
+      // ignore malformed storage
+    }
+  }
+
+  Future<void> _persistManualItems() async {
+    final prefs = await SharedPreferences.getInstance();
+    final map = _manualItems.map(
+      (key, value) => MapEntry(key, value.map(_manualItemToJson).toList()),
+    );
+    await prefs.setString(_manualAgendaPrefKey, jsonEncode(map));
+  }
+
+  ScheduleItem? _manualItemFromJson(Map<String, dynamic> json) {
+    try {
+      final millis = json['time'] as int;
+      return ScheduleItem(
+        title: json['title']?.toString() ?? '',
+        detail: json['detail']?.toString() ?? '',
+        time: DateTime.fromMillisecondsSinceEpoch(millis),
+        isAuto: false,
+        reviewTaskKey: null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Map<String, dynamic> _manualItemToJson(ScheduleItem item) => {
+        'title': item.title,
+        'detail': item.detail,
+        'time': item.time.millisecondsSinceEpoch,
+      };
+
+  void _addManualItemToMap(ScheduleItem item) {
+    final key = _dateKey(item.time);
+    final list = _manualItems.putIfAbsent(key, () => []);
+    list.add(item);
+  }
+
+  void _removeManualItemFromMap(ScheduleItem item) {
+    final key = _dateKey(item.time);
+    final list = _manualItems[key];
+    list?.removeWhere((element) => identical(element, item));
+    if (list != null && list.isEmpty) {
+      _manualItems.remove(key);
+    }
   }
 
   void createSchedule(BuildContext context) {
@@ -1124,7 +1561,9 @@ class AgendaTabState extends State<AgendaTab> {
   void _openEditDialog(BuildContext context, {ScheduleItem? origin, int? index}) async {
     final titleCtrl = TextEditingController(text: origin?.title ?? '');
     final detailCtrl = TextEditingController(text: origin?.detail ?? '');
-    DateTime selected = origin?.time ?? DateTime.now();
+    final now = DateTime.now();
+    final defaultDate = DateTime(widget.currentDate.year, widget.currentDate.month, widget.currentDate.day, now.hour, now.minute);
+    DateTime selected = origin?.time ?? defaultDate;
 
     Future<void> pickDateTime() async {
       final date = await showDatePicker(
@@ -1184,64 +1623,159 @@ class AgendaTabState extends State<AgendaTab> {
       detail: detailCtrl.text,
       time: selected,
       isAuto: false,
+      reviewTaskKey: null,
     );
 
     setState(() {
       if (index != null) {
-        _items[index] = newItem;
-      } else {
-        _items.add(newItem);
+        final oldItem = _items[index];
+        if (!oldItem.isAuto) {
+          _removeManualItemFromMap(oldItem);
+        }
       }
-      _items.sort((a, b) => a.time.compareTo(b.time));
+      _addManualItemToMap(newItem);
+      _items = _buildMergedItems(widget.currentDate, widget.items);
     });
+    await _persistManualItems();
   }
 
-  void _deleteItem(int index) {
+  Future<void> _deleteItem(int index) async {
+    final item = _items[index];
+    if (item.isAuto) {
+      setState(() {
+        _items.removeAt(index);
+      });
+      return;
+    }
+    _removeManualItemFromMap(item);
     setState(() {
-      _items.removeAt(index);
+      _items = _buildMergedItems(widget.currentDate, widget.items);
     });
+    await _persistManualItems();
+  }
+
+  void _handleHorizontalSwipe(DragEndDetails details) {
+    final velocity = details.primaryVelocity ?? 0;
+    if (velocity > 150) {
+      _setDateWithDirection(widget.currentDate.subtract(const Duration(days: 1)), -1);
+    } else if (velocity < -150) {
+      _setDateWithDirection(widget.currentDate.add(const Duration(days: 1)), 1);
+    }
+  }
+
+  void _setDateWithDirection(DateTime target, int direction) {
+    setState(() {
+      _transitionDirection = direction;
+    });
+    widget.onDateChange(target);
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_items.isEmpty) {
-      return const Center(child: Text('今天没有待办，保持良好作息'));
-    }
-    return ListView.separated(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      itemBuilder: (context, index) {
-        final item = _items[index];
-        final itemKey = ValueKey('${item.title}-${item.time.toIso8601String()}');
-        return Dismissible(
-          key: itemKey,
-          background: Container(
-            color: Colors.red.withOpacity(0.8),
-            alignment: Alignment.centerLeft,
-            padding: const EdgeInsets.only(left: 16),
-            child: const Icon(Icons.delete, color: Colors.white),
+    final Widget listContent = _items.isEmpty
+        ? const Center(child: Text('今日暂无待办，点击右下角可添加'))
+        : ListView.separated(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+            itemBuilder: (context, index) {
+              final item = _items[index];
+              final itemKey = ValueKey('${item.title}-${item.time.toIso8601String()}');
+              return Dismissible(
+                key: itemKey,
+                background: Container(
+                  color: Colors.red.withOpacity(0.8),
+                  alignment: Alignment.centerLeft,
+                  padding: const EdgeInsets.only(left: 16),
+                  child: const Icon(Icons.delete, color: Colors.white),
+                ),
+                secondaryBackground: Container(
+                  color: Colors.red.withOpacity(0.8),
+                  alignment: Alignment.centerRight,
+                  padding: const EdgeInsets.only(right: 16),
+                  child: const Icon(Icons.delete, color: Colors.white),
+                ),
+                confirmDismiss: (_) async {
+                  if (item.isAuto && item.reviewTaskKey != null) {
+                    widget.onDeleteAutoTask(item.reviewTaskKey!);
+                  }
+                  await _deleteItem(index);
+                  return true;
+                },
+                child: _ScheduleItemCard(
+                  item: item,
+                  onEdit: item.isAuto ? null : () => _openEditDialog(context, origin: item, index: index),
+                  onDelete: () {
+                    _deleteItem(index);
+                  },
+                ),
+              );
+            },
+            separatorBuilder: (context, index) => const SizedBox(height: 12),
+            itemCount: _items.length,
+          );
+
+    final dateKey = _dateKey(widget.currentDate);
+    final column = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+          child: _DateSwitcher(
+            date: widget.currentDate,
+            onPrevious: () => _setDateWithDirection(widget.currentDate.subtract(const Duration(days: 1)), -1),
+            onNext: () => _setDateWithDirection(widget.currentDate.add(const Duration(days: 1)), 1),
+            onPick: () => _pickAgendaDate(context),
           ),
-          secondaryBackground: Container(
-            color: Colors.red.withOpacity(0.8),
-            alignment: Alignment.centerRight,
-            padding: const EdgeInsets.only(right: 16),
-            child: const Icon(Icons.delete, color: Colors.white),
-          ),
-          confirmDismiss: (_) async {
-            setState(() {
-              _items.removeWhere((element) => element == item);
-            });
-            return true;
-          },
-          child: _ScheduleItemCard(
-            item: item,
-            onEdit: () => _openEditDialog(context, origin: item, index: index),
-            onDelete: () => _deleteItem(index),
-          ),
+        ),
+        Expanded(child: listContent),
+      ],
+    );
+
+    final animatedBody = AnimatedSwitcher(
+      duration: const Duration(milliseconds: 320),
+      transitionBuilder: (child, animation) {
+        final curved = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic, reverseCurve: Curves.easeInCubic);
+        final clamped = _transitionDirection.clamp(-1, 1).toDouble();
+        final offsetTween = Tween<Offset>(
+          begin: Offset(clamped * 0.8, 0),
+          end: Offset.zero,
+        );
+        return SlideTransition(
+          position: offsetTween.animate(curved),
+          child: FadeTransition(opacity: animation, child: child),
         );
       },
-      separatorBuilder: (context, index) => const SizedBox(height: 12),
-      itemCount: _items.length,
+      child: KeyedSubtree(key: ValueKey(dateKey), child: column),
     );
+
+    if (_shouldResetDirection && _transitionDirection != 0) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        setState(() {
+          _transitionDirection = 0;
+          _shouldResetDirection = false;
+        });
+      });
+    }
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onHorizontalDragEnd: _handleHorizontalSwipe,
+      child: animatedBody,
+    );
+  }
+
+  Future<void> _pickAgendaDate(BuildContext context) async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: widget.currentDate,
+      firstDate: DateTime(widget.currentDate.year - 1),
+      lastDate: DateTime(widget.currentDate.year + 1),
+    );
+    if (picked != null) {
+      if (_isSameDay(picked, widget.currentDate)) return;
+      final direction = picked.isBefore(widget.currentDate) ? -1 : 1;
+      _setDateWithDirection(picked, direction);
+    }
   }
 }
 
@@ -1523,6 +2057,38 @@ class _ScheduleItemCard extends StatelessWidget {
   }
 }
 
+class _DateSwitcher extends StatelessWidget {
+  const _DateSwitcher({
+    required this.date,
+    required this.onPrevious,
+    required this.onNext,
+    required this.onPick,
+  });
+
+  final DateTime date;
+  final VoidCallback onPrevious;
+  final VoidCallback onNext;
+  final VoidCallback onPick;
+
+  @override
+  Widget build(BuildContext context) {
+    final label =
+        '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')} ${_weekdayLabel(date.weekday)}';
+    return Row(
+      children: [
+        IconButton(onPressed: onPrevious, icon: const Icon(Icons.chevron_left)),
+        Expanded(
+          child: OutlinedButton(
+            onPressed: onPick,
+            child: Text(label),
+          ),
+        ),
+        IconButton(onPressed: onNext, icon: const Icon(Icons.chevron_right)),
+      ],
+    );
+  }
+}
+
 class Lesson {
   Lesson({
     required this.courseName,
@@ -1681,6 +2247,117 @@ class _LessonAiInputs {
   final List<String> images;
 }
 
+class ReviewPlanSuggestion {
+  const ReviewPlanSuggestion({
+    required this.topic,
+    required this.method,
+    required this.durationMinutes,
+    this.tip,
+  });
+
+  final String topic;
+  final String method;
+  final int durationMinutes;
+  final String? tip;
+
+  static ReviewPlanSuggestion? fromJson(Map<String, dynamic> json) {
+    try {
+      final topic = json['topic']?.toString() ?? '';
+      final method = json['method']?.toString() ?? '';
+      if (topic.trim().isEmpty || method.trim().isEmpty) return null;
+      final duration = json['durationMinutes'] as int? ?? 30;
+      final tip = json['tip']?.toString();
+      return ReviewPlanSuggestion(
+        topic: topic.trim(),
+        method: method.trim(),
+        durationMinutes: duration <= 0 ? 30 : duration,
+        tip: tip?.trim().isEmpty ?? true ? null : tip?.trim(),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+class LessonReviewPlanGenerator {
+  LessonReviewPlanGenerator._();
+  static final LessonReviewPlanGenerator instance = LessonReviewPlanGenerator._();
+  final http.Client _client = http.Client();
+
+  Future<List<ReviewPlanSuggestion>> generate(Lesson lesson, String summary) async {
+    await AppSecrets.ensureLoaded();
+    final apiKey = AppSecrets.siliconApiKey;
+    if (apiKey == null || apiKey.isEmpty) {
+      throw const LessonAiException('未找到 SILICONFLOW_API_KEY，请在 .env 或环境变量中配置');
+    }
+    final buffer = StringBuffer()
+      ..writeln('课程：${lesson.courseName}')
+      ..writeln('教师：${lesson.teacher}')
+      ..writeln('时间：${_formatTime(lesson.startTime)}-${_formatTime(lesson.endTime)}')
+      ..writeln('地点：${lesson.location}')
+      ..writeln('课堂要点：\n$summary')
+      ..writeln('\n请基于以上内容给出 3-5 条复习任务建议，每条包含：topic(复习重点)、method(复习方式)、durationMinutes(建议用时，整数分钟)、tip(可选补充)。')
+      ..writeln('请严格输出 JSON 数组，如 [{"topic":"...","method":"...","durationMinutes":30,"tip":"..."}]，不得包含额外文字。');
+
+    final response = await _client
+        .post(
+          Uri.parse(LessonAiSummarizer._endpoint),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $apiKey',
+          },
+          body: jsonEncode({
+            'model': LessonAiSummarizer._model,
+            'messages': [
+              {
+                'role': 'system',
+                'content': '你是学习规划助理，负责根据课堂要点生成结构化复习任务。输出必须是 JSON 数组。',
+              },
+              {'role': 'user', 'content': buffer.toString()},
+            ],
+            'temperature': 0.2,
+            'max_tokens': 800,
+          }),
+        )
+        .timeout(const Duration(seconds: 60));
+    if (response.statusCode >= 400) {
+      throw LessonAiException('硅基流动接口异常：${response.statusCode} ${response.body}');
+    }
+    final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+    final choices = decoded['choices'] as List<dynamic>?;
+    Map<String, dynamic>? message;
+    if (choices != null && choices.isNotEmpty) {
+      message = choices.first['message'] as Map<String, dynamic>?;
+    }
+    final content = message?['content']?.toString().trim() ?? '';
+    if (content.isEmpty) {
+      throw const LessonAiException('AI 没有返回复习任务');
+    }
+    final jsonText = _extractJsonArray(content);
+    final suggestionsRaw = jsonDecode(jsonText);
+    if (suggestionsRaw is! List) {
+      throw const LessonAiException('复习任务解析失败（非数组）');
+    }
+    final suggestions = suggestionsRaw
+        .map((e) => ReviewPlanSuggestion.fromJson(Map<String, dynamic>.from(e as Map)))
+        .whereType<ReviewPlanSuggestion>()
+        .toList();
+    if (suggestions.isEmpty) {
+      throw const LessonAiException('复习任务解析失败（为空）');
+    }
+    return suggestions;
+  }
+
+  String _extractJsonArray(String content) {
+    final start = content.indexOf('[');
+    final end = content.lastIndexOf(']');
+    if (start != -1 && end != -1 && end > start) {
+      return content.substring(start, end + 1);
+    }
+    return content;
+  }
+}
+
 class AppSecrets {
   static bool _loaded = false;
   static String? _siliconKey;
@@ -1758,6 +2435,10 @@ class ReviewTask {
     required this.offsetFromLesson,
     required this.focus,
     this.note,
+    this.method,
+    this.durationMinutes = 30,
+    this.lessonKey = '',
+    this.aiAdvice,
   });
 
   final String courseName;
@@ -1765,12 +2446,52 @@ class ReviewTask {
   final Duration offsetFromLesson;
   final String focus;
   final String? note;
+  final String? method;
+  final int durationMinutes;
+  final String lessonKey;
+  final String? aiAdvice;
 
   String get memoryCurveLabel {
     final hours = offsetFromLesson.inHours;
     if (hours < 24) return '课后${hours}小时';
     return '课后${offsetFromLesson.inDays}天';
   }
+
+  Map<String, dynamic> toJson() => {
+        'courseName': courseName,
+        'scheduledAt': scheduledAt.millisecondsSinceEpoch,
+        'offsetMinutes': offsetFromLesson.inMinutes,
+        'focus': focus,
+        'note': note,
+        'method': method,
+        'durationMinutes': durationMinutes,
+        'lessonKey': lessonKey,
+        'aiAdvice': aiAdvice,
+      };
+
+  static ReviewTask? fromJson(Map<String, dynamic> json) {
+    try {
+      final scheduledAt = DateTime.fromMillisecondsSinceEpoch(json['scheduledAt'] as int);
+      final offsetMinutes = json['offsetMinutes'] as int? ?? 0;
+      return ReviewTask(
+        courseName: json['courseName']?.toString() ?? '',
+        scheduledAt: scheduledAt,
+        offsetFromLesson: Duration(minutes: offsetMinutes),
+        focus: json['focus']?.toString() ?? '',
+        note: json['note']?.toString(),
+        method: json['method']?.toString(),
+        durationMinutes: json['durationMinutes'] as int? ?? 30,
+        lessonKey: json['lessonKey']?.toString() ?? '',
+        aiAdvice: json['aiAdvice']?.toString(),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+String reviewTaskStorageKey(ReviewTask task) {
+  return '${task.lessonKey}|${task.scheduledAt.millisecondsSinceEpoch}';
 }
 
 class WeekPattern {
@@ -1837,12 +2558,14 @@ class ScheduleItem {
     required this.detail,
     required this.time,
     this.isAuto = true,
+    this.reviewTaskKey,
   });
 
   final String title;
   final String detail;
   final DateTime time;
   final bool isAuto;
+  final String? reviewTaskKey;
 }
 
 class WeekDayLessons {
@@ -1862,15 +2585,21 @@ class WeeklyScheduleOverview {
   final List<ScheduleItem> scheduleItems;
 }
 
+typedef ReviewTaskProvider = List<ReviewTask> Function(DateTime day);
+
 class ScheduleService {
   ScheduleService({
     ScheduleRepository? repository,
     ReviewPlanner? planner,
+    this.reviewTaskProvider,
+    this.enableAutoReviewPlan = true,
   })  : _repository = repository ?? MockScheduleRepository(),
         _planner = planner ?? ReviewPlanner();
 
   final ScheduleRepository _repository;
   final ReviewPlanner _planner;
+  final ReviewTaskProvider? reviewTaskProvider;
+  final bool enableAutoReviewPlan;
 
   Future<WeeklyScheduleOverview> loadWeekOverview(DateTime anchorDay) async {
     final monday = anchorDay.subtract(Duration(days: anchorDay.weekday - 1));
@@ -1882,7 +2611,9 @@ class ScheduleService {
     for (final day in weekDays) {
       final lessons = await _repository.fetchLessonsForDate(day);
       results.add(WeekDayLessons(date: day, lessons: lessons));
-      allReviewTasks.addAll(_planner.generatePlan(lessons));
+      if (enableAutoReviewPlan) {
+        allReviewTasks.addAll(_planner.generatePlan(lessons));
+      }
     }
 
     final scheduleItems = _buildScheduleItems(allReviewTasks, anchorDay);
@@ -1891,32 +2622,27 @@ class ScheduleService {
 
   List<ScheduleItem> _buildScheduleItems(List<ReviewTask> tasks, DateTime anchorDay) {
     final todayStart = DateTime(anchorDay.year, anchorDay.month, anchorDay.day);
-    final todayItems = tasks
+    final combined = <ReviewTask>[];
+    combined.addAll(tasks);
+    if (reviewTaskProvider != null) {
+      combined.addAll(reviewTaskProvider!(todayStart));
+    }
+    final todayItems = combined
         .where((t) => _isSameDay(t.scheduledAt, todayStart))
         .map(
           (t) => ScheduleItem(
             title: '${t.courseName} · 复习',
-            detail: '${t.memoryCurveLabel} | 重点：${t.focus}',
+            detail: [
+              t.memoryCurveLabel,
+              if (t.focus.trim().isNotEmpty) '重点：${t.focus}',
+              if ((t.method ?? t.note)?.trim().isNotEmpty ?? false) '方式：${(t.method ?? t.note)!.trim()}',
+            ].join(' | '),
             time: t.scheduledAt,
             isAuto: true,
+            reviewTaskKey: reviewTaskStorageKey(t),
           ),
         )
         .toList();
-
-    todayItems.addAll([
-      ScheduleItem(
-        title: '图书馆自习',
-        detail: '完成高数作业 + 预习下一章',
-        time: todayStart.add(const Duration(hours: 19)),
-        isAuto: false,
-      ),
-      ScheduleItem(
-        title: '社团会议',
-        detail: '复盘本周活动，安排下周任务',
-        time: todayStart.add(const Duration(hours: 21)),
-        isAuto: false,
-      ),
-    ]);
 
     todayItems.sort((a, b) => a.time.compareTo(b.time));
     return todayItems;
@@ -2012,6 +2738,14 @@ class MemoryScheduleRepository implements ScheduleRepository {
   }
 }
 
+const List<Duration> kReviewPlanIntervals = [
+  Duration(hours: 4),
+  Duration(days: 1),
+  Duration(days: 3),
+  Duration(days: 7),
+  Duration(days: 14),
+];
+
 class ReviewPlanner {
   ReviewPlanner({List<Duration>? reviewIntervals})
       : reviewIntervals = reviewIntervals ??
@@ -2036,6 +2770,7 @@ class ReviewPlanner {
             offsetFromLesson: interval,
             focus: lesson.topic,
             note: _buildSuggestion(interval),
+            lessonKey: lessonStorageKey(lesson),
           ),
         );
       }
@@ -2108,6 +2843,21 @@ const List<TimeSlot> kTimeSlots = [
   TimeSlot(index: 13, label: '第13节', timeRange: '19:40-20:20', start: TimeOfDay(hour: 19, minute: 40), end: TimeOfDay(hour: 20, minute: 20)),
 ];
 
+class _DailyRestBlock {
+  const _DailyRestBlock(this.start, this.end);
+  final TimeOfDay start;
+  final TimeOfDay end;
+
+  DateTime startOn(DateTime day) => DateTime(day.year, day.month, day.day, start.hour, start.minute);
+  DateTime endOn(DateTime day) => DateTime(day.year, day.month, day.day, end.hour, end.minute);
+}
+
+const List<_DailyRestBlock> kDailyRestBlocks = [
+  _DailyRestBlock(TimeOfDay(hour: 11, minute: 40), TimeOfDay(hour: 13, minute: 20)),
+];
+
+const Duration kScheduleBuffer = Duration(minutes: 15);
+
 String _weekdayLabel(int weekday) {
   switch (weekday) {
     case DateTime.monday:
@@ -2146,6 +2896,27 @@ Color _courseColor(String courseName) {
 
 bool _isSameDay(DateTime a, DateTime b) {
   return a.year == b.year && a.month == b.month && a.day == b.day;
+}
+
+bool _timeOverlap(DateTime aStart, DateTime aEnd, DateTime bStart, DateTime bEnd) {
+  return aStart.isBefore(bEnd) && aEnd.isAfter(bStart);
+}
+
+_DateTimeRange? _findRestOverlap(DateTime start, DateTime end) {
+  for (final block in kDailyRestBlocks) {
+    final windowStart = block.startOn(start);
+    final windowEnd = block.endOn(start);
+    if (_timeOverlap(windowStart, windowEnd, start, end)) {
+      return _DateTimeRange(windowStart, windowEnd);
+    }
+  }
+  return null;
+}
+
+class _DateTimeRange {
+  const _DateTimeRange(this.start, this.end);
+  final DateTime start;
+  final DateTime end;
 }
 
 String _formatTime(DateTime time) {
