@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +9,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -50,6 +52,109 @@ class AppThemeSetting {
 const AppThemeSetting _defaultTheme = AppThemeSetting(
   seedColor: Colors.indigo,
 );
+
+class ReminderSettings {
+  const ReminderSettings({
+    required this.enableDailyReminder,
+    required this.dailyReminderTime,
+    required this.leadMinutes,
+    required this.enableQuietHours,
+    required this.quietStart,
+    required this.quietEnd,
+  });
+
+  factory ReminderSettings.defaults() => ReminderSettings(
+        enableDailyReminder: true,
+        dailyReminderTime: const TimeOfDay(hour: 21, minute: 0),
+        leadMinutes: 30,
+        enableQuietHours: true,
+        quietStart: const TimeOfDay(hour: 23, minute: 0),
+        quietEnd: const TimeOfDay(hour: 7, minute: 0),
+      );
+
+  final bool enableDailyReminder;
+  final TimeOfDay dailyReminderTime;
+  final int leadMinutes;
+  final bool enableQuietHours;
+  final TimeOfDay quietStart;
+  final TimeOfDay quietEnd;
+
+  ReminderSettings copyWith({
+    bool? enableDailyReminder,
+    TimeOfDay? dailyReminderTime,
+    int? leadMinutes,
+    bool? enableQuietHours,
+    TimeOfDay? quietStart,
+    TimeOfDay? quietEnd,
+  }) {
+    return ReminderSettings(
+      enableDailyReminder: enableDailyReminder ?? this.enableDailyReminder,
+      dailyReminderTime: dailyReminderTime ?? this.dailyReminderTime,
+      leadMinutes: leadMinutes ?? this.leadMinutes,
+      enableQuietHours: enableQuietHours ?? this.enableQuietHours,
+      quietStart: quietStart ?? this.quietStart,
+      quietEnd: quietEnd ?? this.quietEnd,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'enableDailyReminder': enableDailyReminder,
+        'dailyReminderMinutes': _timeOfDayToMinutes(dailyReminderTime),
+        'leadMinutes': leadMinutes,
+        'enableQuietHours': enableQuietHours,
+        'quietStartMinutes': _timeOfDayToMinutes(quietStart),
+        'quietEndMinutes': _timeOfDayToMinutes(quietEnd),
+      };
+
+  static ReminderSettings? fromJson(dynamic json) {
+    if (json == null) return null;
+    if (json is! Map) return null;
+    final map = Map<String, dynamic>.from(json);
+    try {
+      return ReminderSettings(
+        enableDailyReminder: map['enableDailyReminder'] as bool? ?? true,
+        dailyReminderTime: _minutesToTimeOfDay(map['dailyReminderMinutes'] as int? ?? 1260),
+        leadMinutes: map['leadMinutes'] as int? ?? 30,
+        enableQuietHours: map['enableQuietHours'] as bool? ?? true,
+        quietStart: _minutesToTimeOfDay(map['quietStartMinutes'] as int? ?? 1380),
+        quietEnd: _minutesToTimeOfDay(map['quietEndMinutes'] as int? ?? 420),
+      );
+    } catch (_) {
+      return ReminderSettings.defaults();
+    }
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is ReminderSettings &&
+        other.enableDailyReminder == enableDailyReminder &&
+        other.dailyReminderTime == dailyReminderTime &&
+        other.leadMinutes == leadMinutes &&
+        other.enableQuietHours == enableQuietHours &&
+        other.quietStart == quietStart &&
+        other.quietEnd == quietEnd;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        enableDailyReminder,
+        dailyReminderTime,
+        leadMinutes,
+        enableQuietHours,
+        quietStart,
+        quietEnd,
+      );
+}
+
+int _timeOfDayToMinutes(TimeOfDay time) => time.hour * 60 + time.minute;
+
+TimeOfDay _minutesToTimeOfDay(int minutes) {
+  final normalized = minutes % (24 * 60);
+  final hour = normalized ~/ 60;
+  final minute = normalized % 60;
+  return TimeOfDay(hour: hour, minute: minute);
+}
 
 
 class RemindApp extends StatefulWidget {
@@ -129,15 +234,18 @@ class _HomeShellState extends State<HomeShell> {
   static const String _lessonHighlightPrefKey = 'lesson_highlights';
   static const String _userLessonsPrefKey = 'user_lessons';
   static const String _reviewTaskPrefKey = 'review_tasks';
+  static const String _reminderSettingsPrefKey = 'reminder_settings';
   final Map<String, String> _lessonSummaries = {};
   final Map<String, String> _lessonHighlights = {};
   final Set<String> _aiProcessingLessons = {};
   final Map<String, List<ReviewTask>> _reviewPlans = {};
   final Set<String> _reviewPlanningLessons = {};
+  ReminderSettings _reminderSettings = ReminderSettings.defaults();
 
   @override
   void initState() {
     super.initState();
+    ReminderService.instance.ensureInitialized();
     _displayedWeekAnchor = DateTime.now();
     _repository = MockScheduleRepository();
     _scheduleService = ScheduleService(
@@ -151,6 +259,7 @@ class _HomeShellState extends State<HomeShell> {
     _loadLessonSummaries();
     _loadReviewPlans();
     _loadPersistedLessons();
+    _loadReminderSettings();
   }
 
   void _reload() {
@@ -358,17 +467,73 @@ class _HomeShellState extends State<HomeShell> {
     }
   }
 
-  Future<void> _loadReviewPlans() async {
+  Future<void> _loadReminderSettings() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_reviewTaskPrefKey);
+      final raw = prefs.getString(_reminderSettingsPrefKey);
       if (raw == null) return;
+      final json = jsonDecode(raw);
+      final settings = ReminderSettings.fromJson(json);
+      if (settings == null) return;
+      if (!mounted) return;
+      setState(() {
+        _reminderSettings = settings;
+      });
+    } catch (_) {
+      // ignore malformed
+    }
+  }
+
+  Future<void> _saveReminderSettings(ReminderSettings settings) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_reminderSettingsPrefKey, jsonEncode(settings.toJson()));
+  }
+
+  Future<void> _updateReminderSettings(ReminderSettings settings) async {
+    setState(() {
+      _reminderSettings = settings;
+    });
+    await _saveReminderSettings(settings);
+    await _syncReviewReminders();
+    final agendaState = _agendaKey.currentState;
+    if (agendaState != null) {
+      await agendaState.resyncManualReminders(settings);
+    }
+  }
+
+  Future<void> _syncReviewReminders() async {
+    await ReminderService.instance.syncReviewTasks(
+      settings: _reminderSettings,
+      tasks: _reviewPlans.values.expand((e) => e),
+    );
+  }
+
+  Future<void> _loadReviewPlans() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_reviewTaskPrefKey);
+    if (raw == null) return;
+    try {
       final decoded = jsonDecode(raw);
-      if (decoded is! List) return;
-      final tasks = decoded
-          .map((e) => ReviewTask.fromJson(Map<String, dynamic>.from(e as Map)))
-          .whereType<ReviewTask>()
-          .toList();
+      final tasks = <ReviewTask>[];
+      if (decoded is List) {
+        for (final entry in decoded) {
+          if (entry is Map) {
+            final parsed = ReviewTask.fromJson(Map<String, dynamic>.from(entry));
+            if (parsed != null) tasks.add(parsed);
+          }
+        }
+      } else if (decoded is Map) {
+        for (final value in decoded.values) {
+          if (value is List) {
+            for (final entry in value) {
+              if (entry is Map) {
+                final parsed = ReviewTask.fromJson(Map<String, dynamic>.from(entry));
+                if (parsed != null) tasks.add(parsed);
+              }
+            }
+          }
+        }
+      }
       if (!mounted) return;
       setState(() {
         _reviewPlans
@@ -376,10 +541,12 @@ class _HomeShellState extends State<HomeShell> {
           ..addAll(_groupReviewTasksByLesson(tasks));
       });
       _reload();
+      await _syncReviewReminders();
     } catch (e) {
+      await prefs.remove(_reviewTaskPrefKey);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('复习计划读取失败：$e')),
+        SnackBar(content: Text('复习计划读取失败，已清除旧数据：$e')),
       );
     }
   }
@@ -400,6 +567,7 @@ class _HomeShellState extends State<HomeShell> {
     final prefs = await SharedPreferences.getInstance();
     final flattened = _reviewPlans.values.expand((e) => e).map((e) => e.toJson()).toList();
     await prefs.setString(_reviewTaskPrefKey, jsonEncode(flattened));
+    await _syncReviewReminders();
   }
 
   Future<void> _persistLessonHighlights() async {
@@ -770,6 +938,7 @@ class _HomeShellState extends State<HomeShell> {
             currentDate: _displayedWeekAnchor,
             onDateChange: (date) => _loadWeek(date),
             onDeleteAutoTask: _removeReviewTaskByKey,
+            reminderSettings: _reminderSettings,
           ),
           UserTab(
             onOpenImport: _openWebImport,
@@ -777,6 +946,8 @@ class _HomeShellState extends State<HomeShell> {
             termStartDate: _termStartDate,
             themeSetting: widget.themeSetting,
             onThemeChanged: widget.onThemeChanged,
+            reminderSettings: _reminderSettings,
+            onReminderChanged: _updateReminderSettings,
           ),
         ];
 
@@ -1424,12 +1595,14 @@ class AgendaTab extends StatefulWidget {
     required this.currentDate,
     required this.onDateChange,
     required this.onDeleteAutoTask,
+    required this.reminderSettings,
   });
 
   final List<ScheduleItem> items;
   final DateTime currentDate;
   final ValueChanged<DateTime> onDateChange;
   final ValueChanged<String> onDeleteAutoTask;
+  final ReminderSettings reminderSettings;
 
   @override
   State<AgendaTab> createState() => AgendaTabState();
@@ -1461,6 +1634,9 @@ class AgendaTabState extends State<AgendaTab> {
     }
     if (dateChanged) {
       _shouldResetDirection = true;
+    }
+    if (oldWidget.reminderSettings != widget.reminderSettings) {
+      _syncManualReminders();
     }
   }
 
@@ -1505,6 +1681,7 @@ class AgendaTabState extends State<AgendaTab> {
           ..addAll(map);
         _items = _buildMergedItems(widget.currentDate, widget.items);
       });
+      await _syncManualReminders();
     } catch (_) {
       // ignore malformed storage
     }
@@ -1516,6 +1693,7 @@ class AgendaTabState extends State<AgendaTab> {
       (key, value) => MapEntry(key, value.map(_manualItemToJson).toList()),
     );
     await prefs.setString(_manualAgendaPrefKey, jsonEncode(map));
+    await _syncManualReminders();
   }
 
   ScheduleItem? _manualItemFromJson(Map<String, dynamic> json) {
@@ -1554,8 +1732,22 @@ class AgendaTabState extends State<AgendaTab> {
     }
   }
 
+  Future<void> _syncManualReminders() async {
+    await ReminderService.instance.syncManualItems(
+      settings: widget.reminderSettings,
+      items: _manualItems.values.expand((e) => e),
+    );
+  }
+
   void createSchedule(BuildContext context) {
     _openEditDialog(context);
+  }
+
+  Future<void> resyncManualReminders(ReminderSettings settings) async {
+    await ReminderService.instance.syncManualItems(
+      settings: settings,
+      items: _manualItems.values.expand((e) => e),
+    );
   }
 
   void _openEditDialog(BuildContext context, {ScheduleItem? origin, int? index}) async {
@@ -1565,54 +1757,60 @@ class AgendaTabState extends State<AgendaTab> {
     final defaultDate = DateTime(widget.currentDate.year, widget.currentDate.month, widget.currentDate.day, now.hour, now.minute);
     DateTime selected = origin?.time ?? defaultDate;
 
-    Future<void> pickDateTime() async {
-      final date = await showDatePicker(
-        context: context,
-        initialDate: selected,
-        firstDate: DateTime.now().subtract(const Duration(days: 365)),
-        lastDate: DateTime.now().add(const Duration(days: 365)),
-      );
-      if (date == null) return;
-      final time = await showTimePicker(
-        context: context,
-        initialTime: TimeOfDay.fromDateTime(selected),
-      );
-      if (time == null) return;
-      selected = DateTime(date.year, date.month, date.day, time.hour, time.minute);
-    }
-
     final saved = await showDialog<bool>(
       context: context,
       builder: (ctx) {
-        return AlertDialog(
-          title: Text(origin == null ? '添加日程' : '编辑日程'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '标题')),
-                TextField(controller: detailCtrl, decoration: const InputDecoration(labelText: '详情'), maxLines: 2),
-                const SizedBox(height: 12),
-                Row(
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            Future<void> pickDateTime() async {
+              final date = await showDatePicker(
+                context: dialogContext,
+                initialDate: selected,
+                firstDate: DateTime.now().subtract(const Duration(days: 365)),
+                lastDate: DateTime.now().add(const Duration(days: 365)),
+              );
+              if (date == null) return;
+              final time = await showTimePicker(
+                context: dialogContext,
+                initialTime: TimeOfDay.fromDateTime(selected),
+              );
+              if (time == null) return;
+              setDialogState(() {
+                selected = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+              });
+            }
+
+            return AlertDialog(
+              title: Text(origin == null ? '添加日程' : '编辑日程'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.schedule, size: 18),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        '${selected.year}-${selected.month.toString().padLeft(2, '0')}-${selected.day.toString().padLeft(2, '0')} '
-                        '${selected.hour.toString().padLeft(2, '0')}:${selected.minute.toString().padLeft(2, '0')}',
-                      ),
+                    TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '标题')),
+                    TextField(controller: detailCtrl, decoration: const InputDecoration(labelText: '详情'), maxLines: 2),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Icon(Icons.schedule, size: 18),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            '${selected.year}-${selected.month.toString().padLeft(2, '0')}-${selected.day.toString().padLeft(2, '0')} '
+                            '${selected.hour.toString().padLeft(2, '0')}:${selected.minute.toString().padLeft(2, '0')}',
+                          ),
+                        ),
+                        TextButton(onPressed: pickDateTime, child: const Text('选择时间')),
+                      ],
                     ),
-                    TextButton(onPressed: pickDateTime, child: const Text('选择时间')),
                   ],
                 ),
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('取消')),
+                ElevatedButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('保存')),
               ],
-            ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('保存')),
-          ],
+            );
+          },
         );
       },
     );
@@ -1637,6 +1835,17 @@ class AgendaTabState extends State<AgendaTab> {
       _items = _buildMergedItems(widget.currentDate, widget.items);
     });
     await _persistManualItems();
+    final remindAt = ReminderService.instance.previewReminderTime(newItem.time, widget.reminderSettings);
+    if (!mounted) return;
+    if (remindAt == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('提醒未安排（可能已过期或处于免打扰时段）')),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('提醒已安排：${_formatTime(remindAt)}')),
+    );
   }
 
   Future<void> _deleteItem(int index) async {
@@ -1786,6 +1995,8 @@ class UserTab extends StatelessWidget {
     required this.onPickTermStart,
     required this.themeSetting,
     required this.onThemeChanged,
+    required this.reminderSettings,
+    required this.onReminderChanged,
     this.termStartDate,
   });
 
@@ -1793,6 +2004,8 @@ class UserTab extends StatelessWidget {
   final VoidCallback onPickTermStart;
   final AppThemeSetting themeSetting;
   final ValueChanged<AppThemeSetting> onThemeChanged;
+  final ReminderSettings reminderSettings;
+  final ValueChanged<ReminderSettings> onReminderChanged;
   final DateTime? termStartDate;
 
   @override
@@ -1870,14 +2083,81 @@ class UserTab extends StatelessWidget {
         const SizedBox(height: 24),
         Card(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          child: Column(
-            children: [
-              const _UserSettingTile(
-                icon: Icons.notifications_active_outlined,
-                title: '提醒设置',
-                subtitle: '设置复习提醒与免打扰时段',
-              ),
-            ],
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('提醒设置', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Text(
+                  '当复习日程即将开始时提前发送提醒；在免打扰时段内不会推送通知。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('启用复习提醒'),
+                  subtitle: const Text('在每个复习任务开始前自动提醒'),
+                  value: reminderSettings.enableDailyReminder,
+                  onChanged: (value) => onReminderChanged(reminderSettings.copyWith(enableDailyReminder: value)),
+                ),
+                const SizedBox(height: 8),
+                Text('提前量', style: Theme.of(context).textTheme.bodySmall),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [0, 1, 5, 10, 20, 30, 45, 60, 90, 120]
+                      .map(
+                        (minutes) => ChoiceChip(
+                          label: Text('$minutes 分钟'),
+                          selected: reminderSettings.leadMinutes == minutes,
+                          onSelected: (_) => onReminderChanged(reminderSettings.copyWith(leadMinutes: minutes)),
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 12),
+                const SizedBox(height: 16),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('免打扰时段'),
+                  subtitle: Text(
+                      '在 ${_formatTimeOfDay(reminderSettings.quietStart)} - ${_formatTimeOfDay(reminderSettings.quietEnd)} 之间不推送提醒'),
+                  value: reminderSettings.enableQuietHours,
+                  onChanged: (value) => onReminderChanged(reminderSettings.copyWith(enableQuietHours: value)),
+                ),
+                ListTile(
+                  dense: true,
+                  enabled: reminderSettings.enableQuietHours,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('开始时间'),
+                  trailing: Text(_formatTimeOfDay(reminderSettings.quietStart)),
+                  onTap: reminderSettings.enableQuietHours
+                      ? () => _pickTime(
+                            context,
+                            reminderSettings.quietStart,
+                            (value) => onReminderChanged(reminderSettings.copyWith(quietStart: value)),
+                          )
+                      : null,
+                ),
+                ListTile(
+                  dense: true,
+                  enabled: reminderSettings.enableQuietHours,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('结束时间'),
+                  trailing: Text(_formatTimeOfDay(reminderSettings.quietEnd)),
+                  onTap: reminderSettings.enableQuietHours
+                      ? () => _pickTime(
+                            context,
+                            reminderSettings.quietEnd,
+                            (value) => onReminderChanged(reminderSettings.copyWith(quietEnd: value)),
+                          )
+                      : null,
+                ),
+              ],
+            ),
           ),
         ),
         const SizedBox(height: 24),
@@ -1940,6 +2220,20 @@ class UserTab extends StatelessWidget {
         ),
       ],
     );
+}
+
+  Future<void> _pickTime(BuildContext context, TimeOfDay initial, ValueChanged<TimeOfDay> onSelected) async {
+    final picked = await showTimePicker(
+      context: context,
+      initialTime: initial,
+      builder: (ctx, child) => MediaQuery(
+        data: MediaQuery.of(ctx).copyWith(alwaysUse24HourFormat: true),
+        child: child ?? const SizedBox.shrink(),
+      ),
+    );
+    if (picked != null) {
+      onSelected(picked);
+    }
   }
 }
 
@@ -2923,6 +3217,224 @@ String _formatTime(DateTime time) {
   final hour = time.hour.toString().padLeft(2, '0');
   final minute = time.minute.toString().padLeft(2, '0');
   return '$hour:$minute';
+}
+
+String _formatTimeOfDay(TimeOfDay time) {
+  final hour = time.hour.toString().padLeft(2, '0');
+  final minute = time.minute.toString().padLeft(2, '0');
+  return '$hour:$minute';
+}
+
+class ScheduledReminder {
+  const ScheduledReminder({
+    required this.id,
+    required this.title,
+    required this.scheduledAt,
+  });
+
+  final int id;
+  final String title;
+  final DateTime scheduledAt;
+}
+
+class ReminderService {
+  ReminderService._();
+
+  static final ReminderService instance = ReminderService._();
+  static const MethodChannel _alarmChannel = MethodChannel('alarm_scheduler');
+  final FlutterLocalNotificationsPlugin _plugin = FlutterLocalNotificationsPlugin();
+  bool _initialized = false;
+  final Set<int> _reviewIds = {};
+  final Set<int> _manualIds = {};
+  final Map<int, ScheduledReminder> _scheduled = {};
+
+  Future<void> ensureInitialized() async {
+    if (_initialized) return;
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosInit = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+    const settings = InitializationSettings(android: androidInit, iOS: iosInit);
+    await _plugin.initialize(settings);
+    if (Platform.isAndroid) {
+      final androidSpecific = _plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+      await androidSpecific?.requestNotificationsPermission();
+      await androidSpecific?.requestExactAlarmsPermission();
+    } else if (Platform.isIOS) {
+      final iosSpecific = _plugin.resolvePlatformSpecificImplementation<IOSFlutterLocalNotificationsPlugin>();
+      await iosSpecific?.requestPermissions(alert: true, badge: true, sound: true);
+    } else if (Platform.isMacOS) {
+      final macSpecific = _plugin.resolvePlatformSpecificImplementation<MacOSFlutterLocalNotificationsPlugin>();
+      await macSpecific?.requestPermissions(alert: true, badge: true, sound: true);
+    }
+    _initialized = true;
+  }
+
+  Future<void> syncReviewTasks({
+    required ReminderSettings settings,
+    required Iterable<ReviewTask> tasks,
+  }) async {
+    await ensureInitialized();
+    await _cancelIds(_reviewIds);
+    if (!settings.enableDailyReminder) return;
+    for (final task in tasks) {
+      final remindAt = _calculateReminderTime(task.scheduledAt, settings);
+      if (remindAt == null) continue;
+      final id = _notificationIdFromKey('review|${reviewTaskStorageKey(task)}');
+      final body = [
+        '${_formatTime(task.scheduledAt)}开始',
+        if (task.focus.trim().isNotEmpty) '重点：${task.focus}',
+        if ((task.method ?? '').trim().isNotEmpty) '方式：${task.method!.trim()}',
+      ].join(' | ');
+      await _scheduleAlarm(
+        id: id,
+        title: '${task.courseName} · 复习提醒',
+        body: body,
+        remindAt: remindAt,
+      );
+      _reviewIds.add(id);
+    }
+  }
+
+  Future<void> syncManualItems({
+    required ReminderSettings settings,
+    required Iterable<ScheduleItem> items,
+  }) async {
+    await ensureInitialized();
+    await _cancelIds(_manualIds);
+    if (!settings.enableDailyReminder) return;
+    for (final item in items) {
+      final remindAt = _calculateReminderTime(item.time, settings);
+      if (remindAt == null) continue;
+      final id = _notificationIdFromKey('manual|${item.title}|${item.time.millisecondsSinceEpoch}');
+      await _scheduleAlarm(
+        id: id,
+        title: item.title,
+        body: item.detail.isEmpty ? '即将开始' : item.detail,
+        remindAt: remindAt,
+      );
+      _manualIds.add(id);
+    }
+  }
+
+  Future<void> showTestNotification() async {
+    await ensureInitialized();
+    await _plugin.show(
+      _notificationIdFromKey('debug_test'),
+      '测试提醒',
+      '如果看到这条通知，说明提醒权限正常',
+      _defaultNotificationDetails(),
+    );
+  }
+
+  Future<void> scheduleQuickTestNotification() async {
+    await ensureInitialized();
+    final now = DateTime.now();
+    final remindAt = now.add(const Duration(minutes: 1));
+    await _scheduleAlarm(
+      id: _notificationIdFromKey('debug_scheduled'),
+      title: '测试排程提醒',
+      body: '1 分钟后的排程提醒',
+      remindAt: remindAt,
+    );
+  }
+
+  List<ScheduledReminder> pendingRequests() {
+    final list = _scheduled.values.toList();
+    list.sort((a, b) => a.scheduledAt.compareTo(b.scheduledAt));
+    return list;
+  }
+
+  DateTime? previewReminderTime(DateTime eventTime, ReminderSettings settings) {
+    return _calculateReminderTime(eventTime, settings);
+  }
+
+  Future<void> _cancelIds(Set<int> ids) async {
+    if (ids.isEmpty) return;
+    for (final id in ids) {
+      if (Platform.isAndroid) {
+        await _alarmChannel.invokeMethod<void>('cancel', {'id': id});
+      } else {
+        await _plugin.cancel(id);
+      }
+      _scheduled.remove(id);
+    }
+    ids.clear();
+  }
+
+  DateTime? _calculateReminderTime(DateTime eventTime, ReminderSettings settings) {
+    final now = DateTime.now();
+    if (eventTime.isBefore(now)) {
+      return null;
+    }
+    var remindAt = eventTime.subtract(Duration(minutes: settings.leadMinutes));
+    if (remindAt.isBefore(now)) {
+      remindAt = now.add(const Duration(seconds: 1));
+    }
+    if (_isInQuietHours(remindAt, settings)) {
+      return null;
+    }
+    return remindAt;
+  }
+
+  bool _isInQuietHours(DateTime dateTime, ReminderSettings settings) {
+    if (!settings.enableQuietHours) return false;
+    final start = _timeOfDayToMinutes(settings.quietStart);
+    final end = _timeOfDayToMinutes(settings.quietEnd);
+    final current = dateTime.hour * 60 + dateTime.minute;
+    if (start == end) return false;
+    if (start < end) {
+      return current >= start && current < end;
+    }
+    return current >= start || current < end;
+  }
+
+  NotificationDetails _defaultNotificationDetails() {
+    final androidDetails = AndroidNotificationDetails(
+      'review_schedule_v2',
+      '复习日程提醒',
+      channelDescription: '复习计划及自定义日程提醒',
+      importance: Importance.max,
+      priority: Priority.high,
+      playSound: true,
+      enableVibration: true,
+      vibrationPattern: Int64List.fromList([0, 500, 200, 500]),
+      category: AndroidNotificationCategory.alarm,
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+    );
+    const iosDetails = DarwinNotificationDetails(presentAlert: true, presentSound: true);
+    return NotificationDetails(android: androidDetails, iOS: iosDetails);
+  }
+
+  int _notificationIdFromKey(String key) {
+    return key.hashCode & 0x7fffffff;
+  }
+
+  Future<void> _scheduleAlarm({
+    required int id,
+    required String title,
+    required String body,
+    required DateTime remindAt,
+  }) async {
+    if (Platform.isAndroid) {
+      await _alarmChannel.invokeMethod<void>('schedule', {
+        'id': id,
+        'title': title,
+        'body': body,
+        'triggerAtMillis': remindAt.millisecondsSinceEpoch,
+      });
+    } else {
+      await _plugin.show(
+        id,
+        title,
+        body,
+        _defaultNotificationDetails(),
+      );
+    }
+    _scheduled[id] = ScheduledReminder(id: id, title: title, scheduledAt: remindAt);
+  }
 }
 
 String? _formatLessonRemark(String remark) {
