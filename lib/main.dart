@@ -247,7 +247,7 @@ class _HomeShellState extends State<HomeShell> {
     super.initState();
     ReminderService.instance.ensureInitialized();
     _displayedWeekAnchor = DateTime.now();
-    _repository = MockScheduleRepository();
+    _repository = EmptyScheduleRepository();
     _scheduleService = ScheduleService(
       repository: _repository,
       reviewTaskProvider: _reviewTasksForDate,
@@ -1046,6 +1046,13 @@ class TimetableTab extends StatelessWidget {
     const double slotHeight = 84;
     const double pagePadding = 16;
     const double minDayColumnWidth = 110;
+
+    final hasLessons = weekDays.any((day) => day.lessons.isNotEmpty);
+    if (!hasLessons) {
+      return Center(
+        child: Text('未导入', style: Theme.of(context).textTheme.titleLarge),
+      );
+    }
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2887,7 +2894,7 @@ class ScheduleService {
     ReviewPlanner? planner,
     this.reviewTaskProvider,
     this.enableAutoReviewPlan = true,
-  })  : _repository = repository ?? MockScheduleRepository(),
+  })  : _repository = repository ?? EmptyScheduleRepository(),
         _planner = planner ?? ReviewPlanner();
 
   final ScheduleRepository _repository;
@@ -2947,73 +2954,10 @@ abstract class ScheduleRepository {
   Future<List<Lesson>> fetchLessonsForDate(DateTime date);
 }
 
-class MockScheduleRepository implements ScheduleRepository {
+class EmptyScheduleRepository implements ScheduleRepository {
   @override
   Future<List<Lesson>> fetchLessonsForDate(DateTime date) async {
-    await Future<void>.delayed(const Duration(milliseconds: 240));
-    final dayStart = DateTime(date.year, date.month, date.day);
-
-    if (date.weekday == DateTime.tuesday) {
-      return [
-        Lesson(
-          courseName: '职业规划',
-          teacher: '周老师',
-          startTime: dayStart.add(const Duration(hours: 10)),
-          endTime: dayStart.add(const Duration(hours: 11, minutes: 30)),
-          topic: '简历与面试技巧',
-          location: '学生中心201',
-          weekPattern: const WeekPattern(),
-        ),
-      ];
-    }
-
-    if (date.weekday == DateTime.thursday) {
-      return [
-        Lesson(
-          courseName: '心理健康',
-          teacher: '黄老师',
-          startTime: dayStart.add(const Duration(hours: 15)),
-          endTime: dayStart.add(const Duration(hours: 16, minutes: 30)),
-          topic: '压力管理与自我调节',
-          location: '教学楼C区102',
-          weekPattern: const WeekPattern(),
-        ),
-      ];
-    }
-
-    if (date.weekday == DateTime.saturday || date.weekday == DateTime.sunday) {
-      return [];
-    }
-
-    return [
-      Lesson(
-        courseName: '高等数学',
-        teacher: '王老师',
-        startTime: dayStart.add(const Duration(hours: 8)),
-        endTime: dayStart.add(const Duration(hours: 9, minutes: 40)),
-        topic: '第5章 定积分与应用',
-        location: '教学楼A区205',
-        weekPattern: const WeekPattern(),
-      ),
-      Lesson(
-        courseName: '大学英语',
-        teacher: '李老师',
-        startTime: dayStart.add(const Duration(hours: 10, minutes: 10)),
-        endTime: dayStart.add(const Duration(hours: 11, minutes: 40)),
-        topic: 'Unit 6 Reading Skills',
-        location: '教学楼B区308',
-        weekPattern: const WeekPattern(),
-      ),
-      Lesson(
-        courseName: '数据结构',
-        teacher: '陈老师',
-        startTime: dayStart.add(const Duration(hours: 14)),
-        endTime: dayStart.add(const Duration(hours: 15, minutes: 40)),
-        topic: '第3章 栈与队列',
-        location: '信息楼C区101',
-        weekPattern: const WeekPattern(),
-      ),
-    ];
+    return [];
   }
 }
 
